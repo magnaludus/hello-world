@@ -1,0 +1,14 @@
+{
+  "name": "@loadlab/stats-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Python FastAPI statistics engine for LoadLab. Turbo glue only - real work is in src/loadlab_stats.",
+  "scripts": {
+    "dev": "uvicorn loadlab_stats.api:app --reload --port 8000",
+    "build": "echo 'stats-service: build handled by container image'",
+    "test": "pytest",
+    "typecheck": "mypy src",
+    "lint": "ruff check src tests",
+    "clean": "rm -rf .pytest_cache .ruff_cache .mypy_cache dist build *.egg-info"
+  }
+}

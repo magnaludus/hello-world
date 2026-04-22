@@ -1,0 +1,30 @@
+{
+  "name": "@loadlab/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LoadLab CLI - batch import, analyze, export, power analysis.",
+  "type": "module",
+  "bin": {
+    "loadlab": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo node_modules"
+  },
+  "dependencies": {
+    "@loadlab/chrono-parsers": "workspace:*",
+    "@loadlab/shared": "workspace:*",
+    "commander": "^12.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}
