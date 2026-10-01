@@ -1,0 +1,7 @@
+firmware/dragonbreath/build*/
+firmware/dragonbreath/managed_components/
+firmware/dragonbreath/dependencies.lock
+firmware/dragonbreath/sdkconfig
+cad/out/
+__pycache__/
+.pytest_cache/

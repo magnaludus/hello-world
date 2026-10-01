@@ -1,0 +1,26 @@
+name: cad
+
+on:
+  push:
+    paths: ["cad/**", ".github/workflows/cad.yml"]
+  pull_request:
+    paths: ["cad/**", ".github/workflows/cad.yml"]
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CadQuery
+        run: pip install cadquery pytest
+      - name: Export parts
+        run: python cad/build.py
+      - name: Envelope and clearance tests
+        run: python -m pytest cad/tests -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u1breath-cad
+          path: cad/out

@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 800" width="1100" height="800" font-family="Helvetica, Arial, sans-serif" font-size="9" fill="#222">
+  <title>U1 Breath wiring schematic</title>
+  <desc>Schematic of the U1 Breath chamber heater: 120 V mains path through fuse, SSR, thermal fuse, thermal protector and PTC element; HLK-10M24 AC-DC module; MP1584 buck; XIAO ESP32-C3; MOSFET-driven 24 V blower; WS2812B status LED; three 100K NTC dividers.</desc>
+  <defs>
+    <g id="gnd" stroke="#111" stroke-width="1.5" fill="none">
+      <line x1="0" y1="0" x2="0" y2="6"/>
+      <line x1="-8" y1="6" x2="8" y2="6"/>
+      <line x1="-5" y1="10" x2="5" y2="10"/>
+      <line x1="-2" y1="14" x2="2" y2="14"/>
+    </g>
+    <g id="cap" stroke="#111" stroke-width="1.5" fill="none">
+      <line x1="0" y1="0" x2="0" y2="5"/>
+      <line x1="-7" y1="5" x2="7" y2="5"/>
+      <line x1="-7" y1="10" x2="7" y2="10"/>
+      <line x1="0" y1="10" x2="0" y2="15"/>
+    </g>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1100" height="800" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="30" y="30" font-size="16" font-weight="bold">U1 Breath - wiring schematic</text>
+  <text x="30" y="48" font-size="10" fill="#444">120 V, 300 W PTC chamber heater + 24 V blower, Seeed XIAO ESP32-C3 (DragonBreath fork). Schematic only: pins grouped by function, not board order. See wiring.md for the pin table.</text>
+
+  <!-- ===== MAINS REGION ===== -->
+  <rect x="20" y="70" width="1070" height="130" fill="none" stroke="#c0392b" stroke-width="1" stroke-dasharray="6 4"/>
+  <text x="372" y="82" font-size="9" font-weight="bold" fill="#c0392b">MAINS 120 V - every box and wire in this band lives inside the electronics compartment, under the cover. Crimped terminals only.</text>
+
+  <!-- N return bus (top) -->
+  <polyline points="340,118 360,118 360,62 980,62 980,110" fill="none" stroke="#1f6fd6" stroke-width="2"/>
+  <text x="670" y="58" font-size="9" fill="#1f6fd6" text-anchor="middle">N return (PTC to terminal block)</text>
+
+  <!-- cord -->
+  <rect x="30" y="100" width="80" height="80" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="70" y="112" font-size="10" font-weight="bold" text-anchor="middle">Power cord</text>
+  <text x="70" y="124" font-size="8.5" text-anchor="middle">SJT 18 AWG x 3</text>
+  <text x="70" y="134" font-size="8.5" text-anchor="middle">1.8 m, grounded</text>
+  <text x="70" y="150" font-size="8" text-anchor="middle">N white</text>
+  <text x="70" y="160" font-size="8" text-anchor="middle">L black</text>
+  <text x="70" y="172" font-size="8" text-anchor="middle">PE green</text>
+
+  <!-- cord to grip, grip to block: N, L, PE -->
+  <line x1="110" y1="118" x2="130" y2="118" stroke="#1f6fd6" stroke-width="2"/>
+  <line x1="110" y1="140" x2="130" y2="140" stroke="#d62728" stroke-width="2"/>
+  <line x1="110" y1="162" x2="130" y2="162" stroke="#2ca02c" stroke-width="2"/>
+  <line x1="200" y1="118" x2="230" y2="118" stroke="#1f6fd6" stroke-width="2"/>
+  <line x1="200" y1="140" x2="230" y2="140" stroke="#d62728" stroke-width="2"/>
+  <line x1="200" y1="162" x2="230" y2="162" stroke="#2ca02c" stroke-width="2"/>
+
+  <!-- cord grip -->
+  <rect x="130" y="100" width="70" height="80" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="165" y="130" font-size="10" font-weight="bold" text-anchor="middle">PG7</text>
+  <text x="165" y="143" font-size="8.5" text-anchor="middle">cord grip</text>
+  <text x="165" y="155" font-size="8.5" text-anchor="middle">(strain relief)</text>
+
+  <!-- terminal block -->
+  <rect x="230" y="88" width="110" height="92" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="285" y="100" font-size="8.5" font-weight="bold" text-anchor="middle">Terminal block, 3-pos</text>
+  <rect x="238" y="109" width="94" height="18" fill="#fff" stroke="#1f6fd6"/>
+  <text x="285" y="122" font-size="8.5" text-anchor="middle">N  (cord white)</text>
+  <rect x="238" y="131" width="94" height="18" fill="#fff" stroke="#d62728"/>
+  <text x="285" y="144" font-size="8.5" text-anchor="middle">L  (cord black)</text>
+  <rect x="238" y="153" width="94" height="18" fill="#fff" stroke="#2ca02c"/>
+  <text x="285" y="166" font-size="8.5" text-anchor="middle">PE  (cord green)</text>
+
+  <!-- L: block -> fuse -->
+  <line x1="340" y1="140" x2="385" y2="140" stroke="#d62728" stroke-width="2"/>
+  <text x="362" y="134" font-size="8" fill="#d62728" text-anchor="middle">L</text>
+
+  <!-- fuse -->
+  <rect x="385" y="122" width="70" height="36" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="420" y="136" font-size="10" font-weight="bold" text-anchor="middle">Fuse</text>
+  <text x="420" y="149" font-size="8.5" text-anchor="middle">T5A 250 V, 5x20</text>
+
+  <!-- L: fuse -> SSR load 1, with tap to HLK -->
+  <line x1="455" y1="140" x2="500" y2="140" stroke="#d62728" stroke-width="2"/>
+  <circle cx="470" cy="140" r="3.5" fill="#d62728"/>
+  <polyline points="470,140 470,232 380,232 380,300" fill="none" stroke="#d62728" stroke-width="2"/>
+  <text x="425" y="227" font-size="8" fill="#d62728" text-anchor="middle">L (after fuse)</text>
+
+  <!-- SSR -->
+  <rect x="500" y="110" width="110" height="60" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="555" y="124" font-size="10" font-weight="bold" text-anchor="middle">SSR 10 A zero-cross</text>
+  <text x="555" y="135" font-size="8.5" text-anchor="middle">PCB type, in 3-32 V DC</text>
+  <text x="506" y="151" font-size="8" text-anchor="start">load 1</text>
+  <text x="604" y="151" font-size="8" text-anchor="end">load 2</text>
+  <text x="535" y="164" font-size="9" text-anchor="middle">-</text>
+  <text x="595" y="164" font-size="9" text-anchor="middle">+</text>
+
+  <!-- SSR control -->
+  <polyline points="535,170 535,190" fill="none" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="535" y="190"/>
+  <polyline points="595,170 595,205 660,205 660,240" fill="none" stroke="#7f7f7f" stroke-width="1.5"/>
+  <rect x="655" y="240" width="10" height="30" fill="#fff" stroke="#333"/>
+  <polyline points="660,270 660,320" fill="none" stroke="#7f7f7f" stroke-width="1.5"/>
+  <text x="628" y="216" font-size="8" fill="#555" text-anchor="middle">SSR drive</text>
+  <text x="669" y="259" font-size="8" fill="#333">100 ohm</text>
+
+  <!-- L: SSR load 2 -> thermal fuse -->
+  <line x1="610" y1="140" x2="650" y2="140" stroke="#d62728" stroke-width="2"/>
+
+  <!-- thermal fuse -->
+  <rect x="650" y="122" width="100" height="36" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="700" y="136" font-size="10" font-weight="bold" text-anchor="middle">Thermal fuse</text>
+  <text x="700" y="149" font-size="8.5" text-anchor="middle">130 C, 10 A, one-shot</text>
+  <text x="700" y="172" font-size="8" fill="#555" text-anchor="middle">strapped to the liner</text>
+
+  <line x1="750" y1="140" x2="790" y2="140" stroke="#d62728" stroke-width="2"/>
+
+  <!-- thermal protector -->
+  <rect x="790" y="122" width="100" height="36" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="840" y="136" font-size="10" font-weight="bold" text-anchor="middle">Thermal protector</text>
+  <text x="840" y="149" font-size="8.5" text-anchor="middle">150 C, normally closed</text>
+  <text x="840" y="172" font-size="8" fill="#555" text-anchor="middle">bundled with the PTC</text>
+
+  <line x1="890" y1="140" x2="930" y2="140" stroke="#d62728" stroke-width="2"/>
+
+  <!-- PTC -->
+  <rect x="930" y="110" width="100" height="60" rx="3" fill="#fff1f0" stroke="#333"/>
+  <text x="980" y="128" font-size="10" font-weight="bold" text-anchor="middle">PTC heater</text>
+  <text x="980" y="141" font-size="8.5" text-anchor="middle">300 W, 110 V nameplate</text>
+  <text x="980" y="153" font-size="8.5" text-anchor="middle">insulated, finned</text>
+  <text x="980" y="165" font-size="8" text-anchor="middle">N up, L left</text>
+
+  <!-- N and PE from the terminal block bottom -->
+  <polyline points="300,180 300,262 330,262 330,300" fill="none" stroke="#1f6fd6" stroke-width="2"/>
+  <text x="306" y="222" font-size="8" fill="#1f6fd6">N</text>
+  <polyline points="255,180 255,250 120,250 120,290" fill="none" stroke="#2ca02c" stroke-width="2"/>
+  <text x="262" y="222" font-size="8" fill="#2ca02c">PE</text>
+
+  <!-- PE bond points -->
+  <rect x="40" y="290" width="160" height="50" rx="3" fill="#eefbea" stroke="#2ca02c"/>
+  <text x="120" y="306" font-size="10" font-weight="bold" text-anchor="middle">Heater liner (aluminium)</text>
+  <text x="120" y="319" font-size="8.5" text-anchor="middle">PE bond: ring terminal under</text>
+  <text x="120" y="331" font-size="8.5" text-anchor="middle">its own M3 screw + star washer</text>
+  <line x1="120" y1="340" x2="120" y2="370" stroke="#2ca02c" stroke-width="2"/>
+  <rect x="40" y="370" width="160" height="50" rx="3" fill="#eefbea" stroke="#2ca02c"/>
+  <text x="120" y="386" font-size="10" font-weight="bold" text-anchor="middle">Back plate ground point</text>
+  <text x="120" y="399" font-size="8.5" text-anchor="middle">only if the back plate carries</text>
+  <text x="120" y="411" font-size="8.5" text-anchor="middle">any metal. Ring terminal, M3.</text>
+
+  <!-- ===== LOW VOLTAGE ===== -->
+
+  <!-- HLK-10M24 -->
+  <rect x="280" y="300" width="130" height="70" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="330" y="312" font-size="8" fill="#1f6fd6" text-anchor="middle">N</text>
+  <text x="380" y="312" font-size="8" fill="#d62728" text-anchor="middle">L</text>
+  <text x="345" y="330" font-size="10" font-weight="bold" text-anchor="middle">HLK-10M24</text>
+  <text x="345" y="343" font-size="8.5" text-anchor="middle">AC-DC, 24 V 0.42 A</text>
+  <text x="345" y="355" font-size="8.5" text-anchor="middle">rated to 70 C</text>
+  <text x="404" y="325" font-size="8" text-anchor="end" fill="#ff8c00">+24V</text>
+  <text x="345" y="366" font-size="8" text-anchor="middle">GND</text>
+  <use href="#gnd" x="345" y="370"/>
+
+  <!-- 24 V bus -->
+  <polyline points="410,322 435,322 435,430" fill="none" stroke="#ff8c00" stroke-width="2"/>
+  <line x1="435" y1="345" x2="460" y2="345" stroke="#ff8c00" stroke-width="2"/>
+  <circle cx="435" cy="345" r="3.5" fill="#ff8c00"/>
+  <circle cx="435" cy="430" r="3.5" fill="#ff8c00"/>
+  <text x="424" y="316" font-size="8" fill="#ff8c00" text-anchor="middle">+24 V</text>
+
+  <!-- buck -->
+  <rect x="460" y="320" width="100" height="50" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="510" y="337" font-size="10" font-weight="bold" text-anchor="middle">MP1584 buck</text>
+  <text x="510" y="350" font-size="8.5" text-anchor="middle">24 V to 5.0 V, 1 A</text>
+  <text x="466" y="362" font-size="8" text-anchor="start">IN+</text>
+  <text x="554" y="362" font-size="8" text-anchor="end">OUT+</text>
+  <use href="#gnd" x="510" y="370"/>
+
+  <!-- 5 V -->
+  <line x1="560" y1="345" x2="610" y2="345" stroke="#8e44ad" stroke-width="2"/>
+  <text x="585" y="340" font-size="8" fill="#8e44ad" text-anchor="middle">+5 V</text>
+
+  <!-- blower -->
+  <rect x="280" y="410" width="100" height="80" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="330" y="440" font-size="10" font-weight="bold" text-anchor="middle">Blower 7530</text>
+  <text x="330" y="453" font-size="8.5" text-anchor="middle">24 V DC, 2-wire</text>
+  <text x="330" y="465" font-size="8.5" text-anchor="middle">JST-XH 2-pin</text>
+  <text x="330" y="480" font-size="8" text-anchor="middle">15-20 CFM, 0.2 A</text>
+  <line x1="380" y1="430" x2="460" y2="430" stroke="#ff8c00" stroke-width="2"/>
+  <text x="405" y="426" font-size="8" fill="#ff8c00" text-anchor="middle">+ (red)</text>
+  <line x1="380" y1="465" x2="460" y2="465" stroke="#111" stroke-width="2"/>
+  <text x="420" y="461" font-size="8" fill="#111" text-anchor="middle">- (black)</text>
+
+  <!-- MOSFET module -->
+  <rect x="460" y="410" width="95" height="80" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="507" y="424" font-size="10" font-weight="bold" text-anchor="middle">MOSFET module</text>
+  <text x="466" y="434" font-size="8" text-anchor="start">V+</text>
+  <text x="549" y="434" font-size="8" text-anchor="end">SIG</text>
+  <text x="466" y="469" font-size="8" text-anchor="start">OUT-</text>
+  <text x="507" y="448" font-size="8.5" text-anchor="middle">D4184 / AO3400</text>
+  <text x="507" y="459" font-size="8.5" text-anchor="middle">logic level, low side</text>
+  <text x="507" y="483" font-size="8" text-anchor="middle">GND</text>
+  <use href="#gnd" x="507" y="490"/>
+  <line x1="555" y1="430" x2="610" y2="430" stroke="#7f7f7f" stroke-width="1.5"/>
+  <text x="582" y="425" font-size="8" fill="#555" text-anchor="middle">PWM 25 kHz</text>
+
+  <!-- status LED -->
+  <rect x="460" y="520" width="95" height="60" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="507" y="536" font-size="10" font-weight="bold" text-anchor="middle">WS2812B</text>
+  <text x="507" y="549" font-size="8.5" text-anchor="middle">status LED</text>
+  <text x="466" y="543" font-size="8" text-anchor="start">5V</text>
+  <text x="549" y="543" font-size="8" text-anchor="end">DIN</text>
+  <text x="507" y="562" font-size="8.5" text-anchor="middle">behind translucent</text>
+  <text x="507" y="573" font-size="8.5" text-anchor="middle">window; GND below</text>
+  <use href="#gnd" x="507" y="580"/>
+  <!-- LED 5 V flag + 100 uF -->
+  <line x1="460" y1="540" x2="430" y2="540" stroke="#8e44ad" stroke-width="2"/>
+  <text x="426" y="543" font-size="8" fill="#8e44ad" text-anchor="end">+5 V</text>
+  <circle cx="445" cy="540" r="3.5" fill="#8e44ad"/>
+  <line x1="445" y1="540" x2="445" y2="550" stroke="#111" stroke-width="1.5"/>
+  <use href="#cap" x="445" y="550"/>
+  <use href="#gnd" x="445" y="565"/>
+  <text x="436" y="562" font-size="8" fill="#333" text-anchor="end">100 uF</text>
+  <!-- D10 -> 330 ohm -> DIN -->
+  <polyline points="610,480 585,480 585,497" fill="none" stroke="#7f7f7f" stroke-width="1.5"/>
+  <rect x="580" y="497" width="10" height="26" fill="#fff" stroke="#333"/>
+  <polyline points="585,523 585,540 555,540" fill="none" stroke="#7f7f7f" stroke-width="1.5"/>
+  <text x="577" y="513" font-size="8" fill="#333" text-anchor="end">330 ohm</text>
+  <text x="598" y="476" font-size="8" fill="#555" text-anchor="middle">DIN</text>
+
+  <!-- XIAO ESP32-C3 -->
+  <rect x="610" y="320" width="160" height="300" rx="4" fill="#f3f6fb" stroke="#333" stroke-width="1.5"/>
+  <text x="660" y="334" font-size="9" text-anchor="middle">D4 / GPIO6</text>
+  <text x="616" y="348" font-size="9">5V</text>
+  <text x="616" y="373" font-size="9">GND</text>
+  <text x="616" y="433" font-size="9">D5 / GPIO7</text>
+  <text x="616" y="483" font-size="9">D10 / GPIO10</text>
+  <text x="764" y="348" font-size="9" text-anchor="end">3V3</text>
+  <text x="764" y="403" font-size="9" text-anchor="end">D0 / GPIO2  ADC1_CH2</text>
+  <text x="764" y="498" font-size="9" text-anchor="end">D1 / GPIO3  ADC1_CH3</text>
+  <text x="764" y="593" font-size="9" text-anchor="end">D2 / GPIO4  ADC1_CH4</text>
+  <text x="650" y="612" font-size="9" text-anchor="middle">D6 TX</text>
+  <text x="690" y="612" font-size="9" text-anchor="middle">D7 RX</text>
+  <text x="690" y="514" font-size="11" font-weight="bold" text-anchor="middle">Seeed XIAO</text>
+  <text x="690" y="527" font-size="11" font-weight="bold" text-anchor="middle">ESP32-C3</text>
+  <text x="690" y="544" font-size="8" text-anchor="middle" fill="#444">USB-C: flashing + console</text>
+  <text x="690" y="556" font-size="8" text-anchor="middle" fill="#444">BOOT button (GPIO9): hold 5 s</text>
+  <text x="690" y="568" font-size="8" text-anchor="middle" fill="#444">after boot = factory reset</text>
+  <text x="690" y="580" font-size="8" text-anchor="middle" fill="#444">D3, D8 n.c.  u.FL antenna on shell</text>
+  <!-- XIAO GND -->
+  <line x1="610" y1="370" x2="590" y2="370" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="590" y="370"/>
+  <!-- UART header -->
+  <line x1="650" y1="620" x2="650" y2="650" stroke="#7f7f7f" stroke-width="1.5"/>
+  <line x1="690" y1="620" x2="690" y2="650" stroke="#7f7f7f" stroke-width="1.5"/>
+  <rect x="615" y="650" width="110" height="38" rx="3" fill="#f3f6fb" stroke="#333"/>
+  <text x="670" y="665" font-size="9" font-weight="bold" text-anchor="middle">UART header (optional)</text>
+  <text x="670" y="679" font-size="8.5" text-anchor="middle">TX / RX / GND, 3.3 V logic</text>
+
+  <!-- 3V3 rail -->
+  <polyline points="770,345 1060,345 1060,590" fill="none" stroke="#c2185b" stroke-width="2"/>
+  <circle cx="1060" cy="400" r="3.5" fill="#c2185b"/>
+  <circle cx="1060" cy="495" r="3.5" fill="#c2185b"/>
+  <text x="915" y="340" font-size="8" fill="#c2185b" text-anchor="middle">3V3 (3.3 V from the XIAO regulator)</text>
+
+  <!-- NTC divider row 1: chamber air, Y=400 -->
+  <line x1="770" y1="400" x2="850" y2="400" stroke="#7f7f7f" stroke-width="1.5"/>
+  <circle cx="795" cy="400" r="3.5" fill="#7f7f7f"/>
+  <circle cx="830" cy="400" r="3.5" fill="#7f7f7f"/>
+  <use href="#cap" x="795" y="400"/>
+  <line x1="795" y1="415" x2="795" y2="428" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="795" y="428"/>
+  <text x="795" y="457" font-size="8" fill="#333" text-anchor="middle">100 nF</text>
+  <rect x="850" y="392" width="55" height="16" fill="#fff" stroke="#333"/>
+  <text x="877" y="388" font-size="8" text-anchor="middle">100k 1%</text>
+  <line x1="905" y1="400" x2="1060" y2="400" stroke="#c2185b" stroke-width="2"/>
+  <line x1="830" y1="400" x2="830" y2="415" stroke="#111" stroke-width="1.5"/>
+  <rect x="812" y="415" width="36" height="40" rx="2" fill="#fff" stroke="#333"/>
+  <text x="830" y="432" font-size="8.5" font-weight="bold" text-anchor="middle">NTC</text>
+  <text x="830" y="445" font-size="8" text-anchor="middle">100K</text>
+  <line x1="830" y1="455" x2="830" y2="465" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="830" y="465"/>
+  <text x="858" y="432" font-size="9">Chamber air NTC: glass bead,</text>
+  <text x="858" y="445" font-size="9">in the intake plenum. B3950, 1%.</text>
+
+  <!-- NTC divider row 2: duct / PTC, Y=495 -->
+  <line x1="770" y1="495" x2="850" y2="495" stroke="#7f7f7f" stroke-width="1.5"/>
+  <circle cx="795" cy="495" r="3.5" fill="#7f7f7f"/>
+  <circle cx="830" cy="495" r="3.5" fill="#7f7f7f"/>
+  <use href="#cap" x="795" y="495"/>
+  <line x1="795" y1="510" x2="795" y2="523" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="795" y="523"/>
+  <text x="795" y="552" font-size="8" fill="#333" text-anchor="middle">100 nF</text>
+  <rect x="850" y="487" width="55" height="16" fill="#fff" stroke="#333"/>
+  <text x="877" y="483" font-size="8" text-anchor="middle">100k 1%</text>
+  <line x1="905" y1="495" x2="1060" y2="495" stroke="#c2185b" stroke-width="2"/>
+  <line x1="830" y1="495" x2="830" y2="510" stroke="#111" stroke-width="1.5"/>
+  <rect x="812" y="510" width="36" height="40" rx="2" fill="#fff" stroke="#333"/>
+  <text x="830" y="527" font-size="8.5" font-weight="bold" text-anchor="middle">NTC</text>
+  <text x="830" y="540" font-size="8" text-anchor="middle">100K</text>
+  <line x1="830" y1="550" x2="830" y2="560" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="830" y="560"/>
+  <text x="858" y="527" font-size="9">Duct / PTC NTC: M3 ring lug on</text>
+  <text x="858" y="540" font-size="9">the liner outer side face. B3950, 1%.</text>
+
+  <!-- NTC divider row 3: bed probe, Y=590 -->
+  <line x1="770" y1="590" x2="850" y2="590" stroke="#7f7f7f" stroke-width="1.5"/>
+  <circle cx="795" cy="590" r="3.5" fill="#7f7f7f"/>
+  <circle cx="830" cy="590" r="3.5" fill="#7f7f7f"/>
+  <use href="#cap" x="795" y="590"/>
+  <line x1="795" y1="605" x2="795" y2="618" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="795" y="618"/>
+  <text x="795" y="647" font-size="8" fill="#333" text-anchor="middle">100 nF</text>
+  <rect x="850" y="582" width="55" height="16" fill="#fff" stroke="#333"/>
+  <text x="877" y="578" font-size="8" text-anchor="middle">100k 1%</text>
+  <line x1="905" y1="590" x2="1060" y2="590" stroke="#c2185b" stroke-width="2"/>
+  <line x1="830" y1="590" x2="830" y2="605" stroke="#111" stroke-width="1.5"/>
+  <rect x="812" y="605" width="36" height="40" rx="2" fill="#fff" stroke="#333"/>
+  <text x="830" y="622" font-size="8.5" font-weight="bold" text-anchor="middle">NTC</text>
+  <text x="830" y="635" font-size="8" text-anchor="middle">100K</text>
+  <line x1="830" y1="645" x2="830" y2="655" stroke="#111" stroke-width="1.5"/>
+  <use href="#gnd" x="830" y="655"/>
+  <text x="858" y="622" font-size="9">Bed probe NTC: M3 ring lug under the bed,</text>
+  <text x="858" y="635" font-size="9">600 mm silicone lead, JST-XH 2-pin on unit.</text>
+
+  <!-- ===== LEGEND ===== -->
+  <rect x="30" y="705" width="1040" height="85" rx="3" fill="#fafafa" stroke="#999"/>
+  <text x="40" y="720" font-size="9" font-weight="bold">Legend</text>
+
+  <line x1="40" y1="736" x2="70" y2="736" stroke="#d62728" stroke-width="2"/>
+  <text x="76" y="739">L (mains live)</text>
+  <line x1="160" y1="736" x2="190" y2="736" stroke="#1f6fd6" stroke-width="2"/>
+  <text x="196" y="739">N (mains neutral)</text>
+  <line x1="300" y1="736" x2="330" y2="736" stroke="#2ca02c" stroke-width="2"/>
+  <text x="336" y="739">PE (protective earth)</text>
+  <line x1="460" y1="736" x2="490" y2="736" stroke="#ff8c00" stroke-width="2"/>
+  <text x="496" y="739">+24 V</text>
+  <line x1="560" y1="736" x2="590" y2="736" stroke="#8e44ad" stroke-width="2"/>
+  <text x="596" y="739">+5 V</text>
+  <line x1="650" y1="736" x2="680" y2="736" stroke="#c2185b" stroke-width="2"/>
+  <text x="686" y="739">3V3 (3.3 V)</text>
+  <line x1="770" y1="736" x2="800" y2="736" stroke="#111" stroke-width="2"/>
+  <text x="806" y="739">GND / return</text>
+  <line x1="900" y1="736" x2="930" y2="736" stroke="#7f7f7f" stroke-width="1.5"/>
+  <text x="936" y="739">signal (3.3 V logic)</text>
+
+  <circle cx="55" cy="762" r="3.5" fill="#111"/>
+  <text x="76" y="765">junction (joined)</text>
+  <use href="#gnd" x="175" y="755"/>
+  <text x="196" y="765">common GND (all tie to HLK GND)</text>
+  <rect x="380" y="757" width="26" height="10" fill="#fff" stroke="#333"/>
+  <text x="412" y="765">resistor</text>
+  <use href="#cap" x="475" y="755"/>
+  <text x="496" y="765">capacitor</text>
+  <text x="596" y="765"><tspan fill="#8e44ad">+5 V</tspan> flag = same net as the buck output</text>
+  <text x="806" y="765">Red-tinted boxes carry 120 V. Unplug before opening.</text>
+  <text x="40" y="783" font-size="8" fill="#555">Mains: 18 AWG silicone, crimped spade/ring or ferrules. Low voltage: 22 AWG power, 24 AWG signals and NTC leads. Never run the heater with the blower unplugged. First power-up on a GFCI outlet.</text>
+</svg>
