@@ -9,6 +9,11 @@
 // "Vrail = 0.1 V" was wrong; hardware confirmed ~3.3 V — see PB_VSUPPLY_V in the .c.)
 #pragma once
 
+#if defined(__has_include)
+#  if __has_include("sdkconfig.h")
+#    include "sdkconfig.h"
+#  endif
+#endif
 #include "esp_err.h"
 
 typedef enum {
@@ -21,7 +26,16 @@ typedef enum {
 typedef enum {
     PB_NTC_CHAMBER = 0,
     PB_NTC_PTC = 1,
+    PB_NTC_BED = 2,     // U1 Breath only: printer bed underside probe (local AUTO trigger)
 } pb_ntc_channel_t;
+
+// Channels physically present on the selected board. Reading an absent channel
+// returns PB_NTC_UNINIT and NAN, never a fabricated temperature.
+#ifdef CONFIG_PB_BOARD_U1BREATH
+#define PB_NTC_CHANNEL_COUNT 3
+#else
+#define PB_NTC_CHANNEL_COUNT 2
+#endif
 
 // Raw-count + rail-range fault thresholds (from the stock classifier fcn.4200ca8e;
 // Vsupply hardware-confirmed ~3.3 V). Kept in the header so the pure classifier

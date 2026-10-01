@@ -67,6 +67,12 @@ typedef struct {
     uint8_t dry_hours;            // last accepted drying duration
     float filter_temp_c;          // AUTO fan-only band: blower runs alone at bed>=this
     bool filter_auto_enable;      // enable the AUTO fan-only (filtration) band
+    // U1 Breath local bed probe (PB_NTC_BED): in AUTO, heat engages when the
+    // measured bed temperature reaches probe_on_c and releases below probe_off_c.
+    // The probe also feeds the filtration band. Ignored when disabled.
+    bool probe_auto_enable;
+    float probe_on_c;
+    float probe_off_c;
 } pb_policy_params_t;
 
 typedef struct {
@@ -99,6 +105,11 @@ typedef struct {
                                   // [dragonbreath] helper is the active controller
     float auto_bed_threshold_c;
     pb_policy_params_t params;
+
+    // U1 Breath bed probe (NAN / UNINIT on boards without the channel).
+    float bed_probe_c;
+    pb_ntc_status_t bed_probe_status;
+    bool probe_heat;              // the probe hysteresis is currently demanding heat
 
     bool drying;
     uint32_t drying_remaining_s;
@@ -175,6 +186,24 @@ pb_policy_result_t pb_policy_set_fan(uint8_t percent, db_source_t source);
 pb_policy_result_t pb_policy_set_filter_config(float filter_temp_c, bool enable);
 float pb_policy_get_filter_temp_c(void);
 bool  pb_policy_get_filter_auto_enable(void);
+
+// Local bed-probe AUTO trigger (persisted). on_c in [PROBE_ON_MIN, PROBE_ON_MAX],
+// off_c in [PROBE_OFF_MIN, on_c - PROBE_GAP_MIN]: a real hysteresis band is
+// required so a bed hovering at one temperature cannot chatter the heater.
+#define PB_POLICY_PROBE_ON_MIN_C   50.0f
+#define PB_POLICY_PROBE_ON_MAX_C  120.0f
+#define PB_POLICY_PROBE_OFF_MIN_C  30.0f
+#define PB_POLICY_PROBE_GAP_MIN_C   5.0f
+pb_policy_result_t pb_policy_set_probe_config(bool enable, float on_c, float off_c);
+bool  pb_policy_get_probe_auto_enable(void);
+float pb_policy_get_probe_on_c(void);
+float pb_policy_get_probe_off_c(void);
+
+// Pure bed-probe hysteresis (exposed for host testing): demand heat once the probe
+// reads >= on_c, hold until it reads < off_c, and hold the previous decision while
+// the probe is not readable (a dead probe can never START heat; it can only keep an
+// already-running AUTO session until the chamber/PTC safety layers or Klipper act).
+bool pb_probe_decide(bool probe_ok, float probe_c, float on_c, float off_c, bool prev);
 
 // Update printer environment used by AUTO.  This is observer input, not a
 // control command, and therefore never creates or refreshes a control lease.

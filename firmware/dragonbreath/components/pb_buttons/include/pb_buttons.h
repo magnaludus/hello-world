@@ -19,8 +19,13 @@
 
 #include "esp_err.h"
 
-// Hold time for the Power+Auto recovery combo.
+// Hold time for the recovery combo (Power+Auto on the Panda; the single BOOT
+// button on U1 Breath, where it is longer because the 2 s panic-off precedes it).
+#ifdef CONFIG_PB_BOARD_U1BREATH
+#define PB_BTN_RESET_COMBO_MS 10000
+#else
 #define PB_BTN_RESET_COMBO_MS 5000
+#endif
 
 typedef enum {
     PB_BUTTON_POWER = 0,   // GPIO9  (⚠ ROM download-mode strap)

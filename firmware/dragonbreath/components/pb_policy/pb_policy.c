@@ -43,6 +43,9 @@ static const char *TAG = "pb_policy";
 #define PB_NVS_KEY_DRY_HRS          "md_dry_hrs"
 #define PB_NVS_KEY_FILT_TMP         "md_filt_tmp"
 #define PB_NVS_KEY_FILT_EN          "md_filt_en"
+#define PB_NVS_KEY_PRB_EN           "md_prb_en"
+#define PB_NVS_KEY_PRB_ON           "md_prb_on"
+#define PB_NVS_KEY_PRB_OFF          "md_prb_off"
 
 #define PB_AUTO_BED_MIN_C           40.0f
 #define PB_AUTO_BED_MAX_C          120.0f
@@ -55,9 +58,21 @@ static const char *TAG = "pb_policy";
 #define PB_DEFAULT_AUTO_BED_C      100.0f
 #define PB_DEFAULT_DRY_TARGET_C     60.0f
 #define PB_DEFAULT_DRY_HOURS        12U
+#ifdef CONFIG_PB_BOARD_U1BREATH
+// U1 Breath: the bed probe is the whole point of the standalone mode, so the
+// local trigger and the filtration band ship ON. 45 C filters every print
+// (PLA beds run 50-60 C); 90/70 C heats only for ABS/ASA/PC class beds.
+#define PB_DEFAULT_FILTER_TEMP_C    45.0f
+#define PB_DEFAULT_FILTER_AUTO_EN   true
+#define PB_DEFAULT_PROBE_AUTO_EN    true
+#else
 #define PB_DEFAULT_FILTER_TEMP_C    30.0f
 #define PB_DEFAULT_FILTER_AUTO_EN   false   // opt-in (diverges from stock, which
                                             // filters by default) — see OEM_PARITY.md
+#define PB_DEFAULT_PROBE_AUTO_EN    false   // no bed probe channel on the Panda
+#endif
+#define PB_DEFAULT_PROBE_ON_C       90.0f
+#define PB_DEFAULT_PROBE_OFF_C      70.0f
 
 typedef struct {
     pb_mode_t mode;
@@ -82,6 +97,7 @@ typedef struct {
     float auto_bed_threshold_c;
     bool auto_engaged;
     bool auto_filtering;         // AUTO fan-only band latch (blower on, no heat)
+    bool probe_heat;             // local bed-probe hysteresis latch (AUTO only)
     float src_target_c;          // source-requested chamber target (e.g. Bambu filament
                                  // zone); 0 = none. When >0 in AUTO it engages heat to
                                  // this target directly, bypassing the bed threshold.
@@ -201,6 +217,7 @@ static void set_off_locked(db_source_t source)
     s.drying_deadline_us = 0;
     s.local_power_deadline_us = 0;
     s.resume_mode = PB_MODE_OFF;   // #72: explicit/hard OFF never reverts
+    s.probe_heat = false;
     lease_invalidate_locked();
     revision_advance_locked(source);
 }
@@ -221,6 +238,7 @@ static void restore_or_off_locked(db_source_t source)
     s.auto_bed_threshold_c = s.params.auto_bed_threshold_c;
     s.auto_engaged = false;
     s.auto_filtering = false;
+    s.probe_heat = false;
     s.drying_deadline_us = 0;
     s.local_power_deadline_us = 0;
     s.resume_mode = PB_MODE_OFF;
@@ -270,6 +288,14 @@ static void params_clamp(pb_policy_params_t *p)
     p->filter_temp_c = clamp_or_default(
         p->filter_temp_c, PB_POLICY_FILTER_TEMP_MIN_C,
         PB_POLICY_FILTER_TEMP_MAX_C, PB_DEFAULT_FILTER_TEMP_C);
+    p->probe_on_c = clamp_or_default(
+        p->probe_on_c, PB_POLICY_PROBE_ON_MIN_C,
+        PB_POLICY_PROBE_ON_MAX_C, PB_DEFAULT_PROBE_ON_C);
+    p->probe_off_c = clamp_or_default(
+        p->probe_off_c, PB_POLICY_PROBE_OFF_MIN_C,
+        p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C, PB_DEFAULT_PROBE_OFF_C);
+    if (p->probe_off_c > p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C)   // default itself out of band
+        p->probe_off_c = p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C;
 }
 
 static void params_defaults_locked(void)
@@ -281,6 +307,9 @@ static void params_defaults_locked(void)
     s.params.dry_hours            = PB_DEFAULT_DRY_HOURS;
     s.params.filter_temp_c        = PB_DEFAULT_FILTER_TEMP_C;
     s.params.filter_auto_enable   = PB_DEFAULT_FILTER_AUTO_EN;
+    s.params.probe_auto_enable    = PB_DEFAULT_PROBE_AUTO_EN;
+    s.params.probe_on_c           = PB_DEFAULT_PROBE_ON_C;
+    s.params.probe_off_c          = PB_DEFAULT_PROBE_OFF_C;
 }
 
 // Wake the persistence worker. Call AFTER releasing s_lock: NVS writes must
@@ -310,6 +339,12 @@ static esp_err_t persist_params(const pb_policy_params_t *p)
                                c_to_centi(s_written.filter_temp_c) },
         { PB_NVS_KEY_FILT_EN,  p->filter_auto_enable ? 1u : 0u,
                                s_written.filter_auto_enable ? 1u : 0u },
+        { PB_NVS_KEY_PRB_EN,   p->probe_auto_enable ? 1u : 0u,
+                               s_written.probe_auto_enable ? 1u : 0u },
+        { PB_NVS_KEY_PRB_ON,   c_to_centi(p->probe_on_c),
+                               c_to_centi(s_written.probe_on_c) },
+        { PB_NVS_KEY_PRB_OFF,  c_to_centi(p->probe_off_c),
+                               c_to_centi(s_written.probe_off_c) },
     };
     const size_t n = sizeof kv / sizeof kv[0];
 
@@ -396,6 +431,12 @@ void pb_policy_load_params(void)
             p.filter_temp_c = centi_to_c(v);
         if (nvs_get_u32(h, PB_NVS_KEY_FILT_EN, &v) == ESP_OK)
             p.filter_auto_enable = (v != 0);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_EN, &v) == ESP_OK)
+            p.probe_auto_enable = (v != 0);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_ON, &v) == ESP_OK)
+            p.probe_on_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_OFF, &v) == ESP_OK)
+            p.probe_off_c = centi_to_c(v);
         nvs_close(h);
     }
     params_clamp(&p);
@@ -591,7 +632,18 @@ void pb_policy_set_mode_off(db_source_t source)
 {
     if (!s_lock) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    // Klipper's `M141 S0` ends KLIPPER'S run. On U1 Breath a local AUTO session
+    // (bed probe) commonly sits underneath a print's M141/M191 override, so that
+    // end-of-print OFF returns to AUTO "waiting" instead of killing the probe
+    // automation. Web/button/safety OFF remain hard OFF.
+    if (source == DB_SOURCE_KLIPPER && s.resume_mode == PB_MODE_AUTO)
+        restore_or_off_locked(source);
+    else
+        set_off_locked(source);
+#else
     set_off_locked(source);
+#endif
     xSemaphoreGive(s_lock);
     wake_control_task();
 }
@@ -654,6 +706,53 @@ pb_policy_result_t pb_policy_set_filter_config(float filter_temp_c, bool enable)
     params_notify();
     wake_control_task();      // re-evaluate the AUTO band on the next tick
     return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_set_probe_config(bool enable, float on_c, float off_c)
+{
+    if (!s_lock || !isfinite(on_c) || !isfinite(off_c)
+            || on_c < PB_POLICY_PROBE_ON_MIN_C || on_c > PB_POLICY_PROBE_ON_MAX_C
+            || off_c < PB_POLICY_PROBE_OFF_MIN_C
+            || off_c > on_c - PB_POLICY_PROBE_GAP_MIN_C)
+        return PB_POLICY_INVALID;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s.params.probe_auto_enable = enable;
+    s.params.probe_on_c = on_c;
+    s.params.probe_off_c = off_c;
+    if (!enable) s.probe_heat = false;
+    s.params_dirty = true;
+    revision_advance_locked(DB_SOURCE_WEB);
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    params_notify();
+    return PB_POLICY_OK;
+}
+
+bool pb_policy_get_probe_auto_enable(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_AUTO_EN;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool v = s.params.probe_auto_enable;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+float pb_policy_get_probe_on_c(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_ON_C;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float v = s.params.probe_on_c;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+float pb_policy_get_probe_off_c(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_OFF_C;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float v = s.params.probe_off_c;
+    xSemaphoreGive(s_lock);
+    return v;
 }
 
 float pb_policy_get_filter_temp_c(void)
@@ -896,7 +995,17 @@ void pb_policy_on_button(pb_button_id_t id, pb_button_event_t ev)
             // Master OFF. Already-off is a deliberate no-op: log it but do not
             // bump the revision, so an idle tap does not churn observers.
             if (pb_policy_get_mode() == PB_MODE_OFF) {
+#ifdef CONFIG_PB_BOARD_U1BREATH
+                // Single-button board: a tap while OFF arms AUTO (bed probe +
+                // Klipper follow); a tap in any mode is still master OFF.
+                r = button_toggle_mode(PB_MODE_AUTO);
+                if (r == PB_POLICY_OK)
+                    dc_evlog_add("btn: power -> %s", pb_policy_mode_str(pb_policy_get_mode()));
+                else
+                    dc_evlog_add("btn: power auto rejected (%s)", pb_policy_result_str(r));
+#else
                 dc_evlog_add("btn: power (already off)");
+#endif
             } else {
                 pb_policy_set_mode_off(DB_SOURCE_BUTTON);
                 dc_evlog_add("btn: power -> off");
@@ -935,6 +1044,14 @@ bool pb_purge_decide(bool heat, bool *heated_this_session,
     return cooldown;
 }
 
+bool pb_probe_decide(bool probe_ok, float probe_c, float on_c, float off_c, bool prev)
+{
+    if (!probe_ok || !isfinite(probe_c)) return prev;
+    if (probe_c >= on_c)  return true;
+    if (probe_c <  off_c) return false;
+    return prev;
+}
+
 void pb_policy_tick(void)
 {
     if (!s_lock) return;
@@ -944,6 +1061,10 @@ void pb_policy_tick(void)
     const char *watchdog_reason = NULL;
     float target = 0.0f;
     bool autonomous = false;
+    // Local bed probe (U1 Breath). NAN/UNINIT on boards without the channel, which
+    // simply disables every probe path below.
+    float probe_c = pb_ntc_smoothed_c(PB_NTC_BED);
+    bool probe_ok = pb_ntc_last_status(PB_NTC_BED) == PB_NTC_OK && isfinite(probe_c);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     switch (s.mode) {
@@ -982,17 +1103,28 @@ void pb_policy_tick(void)
             // and always to that target. Safety cutoffs are evaluated elsewhere and
             // are unaffected; this only ever narrows when AUTO heats.
             bool was_engaged = s.auto_engaged;
+            // U1 Breath local trigger: the probe under the printer's bed. It is a
+            // physical sensor on the machine, so it is honoured even with the
+            // Klipper helper installed; Klipper's own M141/M191 still wins by
+            // moving the device to POWER_ON (and returns here on its M141 S0).
+            s.probe_heat = s.params.probe_auto_enable
+                ? pb_probe_decide(probe_ok, probe_c, s.params.probe_on_c,
+                                  s.params.probe_off_c, s.probe_heat)
+                : false;
             // When the Klipper [dragonbreath] helper is installed it is the active
             // manual controller; AUTO must not also drive the heater (two pieces of
             // software cannot own the target). AUTO stays armed but never engages
             // while the helper is present — the helper's commands drive POWER_ON
             // instead. Remove the helper and AUTO resumes on the next tick.
-            s.auto_engaged = (!s.klipper_helper_present
-                              && s.mk_connected && s.src_target_c > 0.0f);
+            bool zone_engaged = (!s.klipper_helper_present
+                                 && s.mk_connected && s.src_target_c > 0.0f);
+            s.auto_engaged = zone_engaged || s.probe_heat;
             if (s.auto_engaged != was_engaged)
                 revision_advance_locked(s.source);
             if (s.auto_engaged) {
-                target = s.src_target_c;
+                // A printer-reported filament zone is more specific than the local
+                // AUTO card target, so it wins when both are available.
+                target = zone_engaged ? s.src_target_c : s.requested_target_c;
                 autonomous = true;
             }
             break;
@@ -1011,6 +1143,7 @@ void pb_policy_tick(void)
         default:
             break;
     }
+    if (s.mode != PB_MODE_AUTO) s.probe_heat = false;   // the latch lives in AUTO only
 
     if (watchdog_trip) {
         // Sole control-task path for a latching remote/local timeout.
@@ -1084,13 +1217,21 @@ void pb_policy_tick(void)
     // hysteresis; fails to no-airflow when disabled or the Moonraker link drops.
     {
         bool was_filtering = s.auto_filtering;
-        if (!s.mk_connected || !s.params.filter_auto_enable) {
+        // Trigger input: the printer's commanded bed setpoint while a source is
+        // connected, or (U1 Breath) the local probe's MEASURED bed temperature
+        // while it is enabled and readable — whichever is higher.
+        bool  filt_avail = s.mk_connected;
+        float filt_in    = s.mk_connected ? s.bed_target_c : 0.0f;
+        if (s.params.probe_auto_enable && probe_ok) {
+            filt_avail = true;
+            if (probe_c > filt_in) filt_in = probe_c;
+        }
+        if (!filt_avail || !s.params.filter_auto_enable) {
             s.auto_filtering = false;
-        } else if (!s.auto_filtering && s.bed_target_c >= s.params.filter_temp_c) {
+        } else if (!s.auto_filtering && filt_in >= s.params.filter_temp_c) {
             s.auto_filtering = true;
         } else if (s.auto_filtering
-                   && s.bed_target_c < s.params.filter_temp_c
-                                  - PB_AUTO_BED_HYSTERESIS_C) {
+                   && filt_in < s.params.filter_temp_c - PB_AUTO_BED_HYSTERESIS_C) {
             s.auto_filtering = false;
         }
         if (s.auto_filtering != was_filtering)
@@ -1152,6 +1293,7 @@ void pb_policy_get_snapshot(pb_policy_snapshot_t *out)
     out->auto_blocked_by_helper = (s.mode == PB_MODE_AUTO && s.klipper_helper_present);
     out->auto_bed_threshold_c = s.auto_bed_threshold_c;
     out->params = s.params;
+    out->probe_heat = s.probe_heat;
     out->drying = s.mode == PB_MODE_DRYING;
     if (out->drying && s.drying_deadline_us > now) {
         out->drying_remaining_s =
@@ -1181,6 +1323,9 @@ void pb_policy_get_snapshot(pb_policy_snapshot_t *out)
         ? pb_ntc_smoothed_c(PB_NTC_CHAMBER) : NAN;
     out->ptc_c = out->ptc_status == PB_NTC_OK
         ? pb_ntc_smoothed_c(PB_NTC_PTC) : NAN;
+    out->bed_probe_status = pb_ntc_last_status(PB_NTC_BED);
+    out->bed_probe_c = out->bed_probe_status == PB_NTC_OK
+        ? pb_ntc_smoothed_c(PB_NTC_BED) : NAN;
 
     // Report the ACTUAL residual-heat purge state, not an inference from fan
     // levels. The old "effective fan > requested fan" heuristic also matched the

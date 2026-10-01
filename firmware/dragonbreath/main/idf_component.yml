@@ -43,3 +43,5 @@ dependencies:
     git: https://github.com/justinh-rahb/dragon-core.git
     path: components/dc_peer
     version: v0.35.2
+  # U1 Breath board: single WS2812 status pixel (RMT backend).
+  espressif/led_strip: "^3.0.0"

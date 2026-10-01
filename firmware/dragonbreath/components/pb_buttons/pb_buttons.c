@@ -50,7 +50,8 @@ bool pb_buttons_hil_pressed(pb_button_id_t id)
     return s_btns[id].sm.pressed;
 }
 #else
-static int sample(const btn_t *b) { return gpio_get_level(b->pin); }
+// A button absent on this board (pin GPIO_NUM_NC) always reads released.
+static int sample(const btn_t *b) { return b->pin < 0 ? 1 : gpio_get_level(b->pin); }
 
 static void configure_pin(gpio_num_t pin)
 {
@@ -85,11 +86,20 @@ static void button_task(void *arg)
         // also fire Power's panic-off or Auto's mode toggle); at the threshold we
         // emit exactly one PB_BUTTON_RESET. esp_restart() in the handler means the
         // == test can never re-fire.
+#ifdef CONFIG_PB_BOARD_U1BREATH
+        // Single-button board: the recovery combo is the one button held for
+        // PB_BTN_RESET_COMBO_MS. Its own short/long events are NOT swallowed, so
+        // the 2 s long-press panic-off still fires on the way to the reset.
+        bool combo = s_btns[PB_BUTTON_POWER].sm.pressed;
+        const bool swallow = false;
+#else
         bool combo = s_btns[PB_BUTTON_POWER].sm.pressed &&
                      s_btns[PB_BUTTON_AUTO].sm.pressed;
+        const bool swallow = true;
+#endif
         if (combo) {
             if (++combo_ticks == PB_BTN_RESET_COMBO_TICKS) {
-                ESP_LOGW(TAG, "Power+Auto held %d ms: emitting reset combo",
+                ESP_LOGW(TAG, "reset button combo held %d ms: emitting reset",
                          PB_BTN_RESET_COMBO_MS);
                 if (s_cb) s_cb(PB_BUTTON_POWER, PB_BUTTON_RESET);
             }
@@ -99,7 +109,7 @@ static void button_task(void *arg)
 
         for (int i = 0; i < PB_BUTTON_COUNT; ++i) {
             if (evs[i] == PB_BTN_EV_NONE || !s_cb) continue;
-            if (combo && (i == PB_BUTTON_POWER || i == PB_BUTTON_AUTO)) continue;
+            if (swallow && combo && (i == PB_BUTTON_POWER || i == PB_BUTTON_AUTO)) continue;
             s_cb(s_btns[i].id,
                  evs[i] == PB_BTN_EV_LONG ? PB_BUTTON_LONG : PB_BUTTON_SHORT);
         }
@@ -114,7 +124,7 @@ esp_err_t pb_buttons_start(pb_button_cb_t cb)
 
     for (int i = 0; i < PB_BUTTON_COUNT; ++i) {
 #ifndef CONFIG_PB_DEVBOARD_SAFE
-        configure_pin(s_btns[i].pin);
+        if (s_btns[i].pin >= 0) configure_pin(s_btns[i].pin);
 #endif
         // Seed from a live sample so a button held through boot (or a shorted
         // line) is ignored until it releases.

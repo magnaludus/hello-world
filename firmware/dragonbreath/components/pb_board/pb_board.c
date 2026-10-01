@@ -7,7 +7,9 @@ static const char *TAG = "pb_board";
 
 void pb_board_init(void)
 {
-#ifdef CONFIG_PB_DEVBOARD_SAFE
+#if defined(CONFIG_PB_BOARD_U1BREATH)
+    ESP_LOGI(TAG, "board init: U1 Breath (XIAO ESP32-C3); heater/fan/LED owned by their components");
+#elif defined(CONFIG_PB_DEVBOARD_SAFE)
     ESP_LOGW(TAG, "safe dev-board target: production board GPIO init compiled out");
 #else
     const gpio_config_t leds = {
@@ -36,7 +38,9 @@ void pb_board_init(void)
 
 int pb_board_rref_kohm(void)
 {
-#ifdef CONFIG_PB_DEVBOARD_SAFE
+#if defined(CONFIG_PB_BOARD_U1BREATH)
+    return PB_BOARD_RREF_KOHM;      // fixed dividers: nothing to detect
+#elif defined(CONFIG_PB_DEVBOARD_SAFE)
     return 82;
 #else
     // The Rref strap on GPIO19 selects the divider reference resistor (level 0 -> 82k,

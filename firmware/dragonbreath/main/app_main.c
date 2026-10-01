@@ -344,6 +344,11 @@ static void control_task(void *arg)
         // Safety/control loop: enforces every heater cutoff + fan-follows-heater.
         // pb_policy is the sole mode/target writer. Network clients and local
         // inputs submit commands to it; this task applies the resulting outputs.
+#ifdef CONFIG_PB_BOARD_U1BREATH
+        // Bed probe: take the sample that feeds pb_ntc's smoothed reading, which
+        // pb_policy's local AUTO trigger and the filtration band read each tick.
+        { float bed_probe_c; (void)pb_ntc_read(PB_NTC_BED, &bed_probe_c); }
+#endif
         pb_policy_tick();
         if (wdt_armed) esp_task_wdt_reset();   // successful loop iteration
 

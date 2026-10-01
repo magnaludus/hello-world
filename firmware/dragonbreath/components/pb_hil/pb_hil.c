@@ -281,6 +281,8 @@ static void handle_request(const cJSON *request)
         pb_ntc_channel_t ch = PB_NTC_CHAMBER;
         if (valid && strcmp(channel->valuestring, "ptc") == 0)
             ch = PB_NTC_PTC;
+        else if (valid && PB_NTC_CHANNEL_COUNT > 2 && strcmp(channel->valuestring, "bed") == 0)
+            ch = PB_NTC_BED;
         else if (!valid || strcmp(channel->valuestring, "chamber") != 0)
             valid = false;
         if (valid) {

@@ -7,8 +7,34 @@
 // INFERRED should be continuity-tested before the first flash to real hardware.
 #pragma once
 
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "hal/adc_types.h"
+
+#ifdef CONFIG_PB_BOARD_U1BREATH
+// ======== U1 Breath — Seeed XIAO ESP32-C3 carrier =========================
+// Chamber heater + HEPA/carbon filter for the Snapmaker U1. All pins below are
+// XIAO header pins; GPIO18/19 (native USB) stay free for flashing/console.
+#define PB_GPIO_RELAY        GPIO_NUM_6    // XIAO D4 -> SSR+ (100R series), SSR- -> GND
+#define PB_GPIO_FAN_PWM      GPIO_NUM_7    // XIAO D5 -> MOSFET module SIG, 25 kHz PWM
+#define PB_FAN_MIN_PERCENT   40            // 7530 DC blower reliable-start floor
+#define PB_GPIO_NTC_CHAMBER  GPIO_NUM_2    // XIAO D0, ADC1_CH2: chamber air (intake plenum)
+#define PB_GPIO_NTC_PTC      GPIO_NUM_3    // XIAO D1, ADC1_CH3: heater duct liner wall
+#define PB_GPIO_NTC_BED      GPIO_NUM_4    // XIAO D2, ADC1_CH4: printer bed underside probe
+#define PB_ADC_UNIT          ADC_UNIT_1
+#define PB_ADC_CH_CHAMBER    ADC_CHANNEL_2
+#define PB_ADC_CH_PTC        ADC_CHANNEL_3
+#define PB_ADC_CH_BED        ADC_CHANNEL_4
+#define PB_BOARD_RREF_KOHM   100           // fixed 100k 1% low-side dividers, no strap
+#define PB_GPIO_LED_WS2812   GPIO_NUM_10   // XIAO D10 -> WS2812 DIN (330R series)
+#define PB_GPIO_BTN_POWER    GPIO_NUM_9    // XIAO BOOT button (strap: HIGH at reset)
+#define PB_GPIO_BTN_AUTO     GPIO_NUM_NC   // single-button board
+#define PB_GPIO_BTN_ON       GPIO_NUM_NC
+#define PB_GPIO_BTN_DRY      GPIO_NUM_NC
+#define PB_GPIO_UART_TX      GPIO_NUM_21   // XIAO D6 (optional UART console header)
+#define PB_GPIO_UART_RX      GPIO_NUM_20   // XIAO D7
+#else
+// ======== BIGTREETECH Panda Breath V1.0 / V1.0.1 ==========================
 
 // -------- Heater (safety-critical) -----------------------------------------
 // GPIO18 -> Q3 NPN -> MGR-GJ-5-L solid-state relay coil -> PTC heater AC switch.
@@ -63,6 +89,8 @@
 // -------- Console UART0 (CH340K USB-C bridge) -------------------------------
 #define PB_GPIO_UART_TX      GPIO_NUM_21
 #define PB_GPIO_UART_RX      GPIO_NUM_20
+
+#endif // CONFIG_PB_BOARD_U1BREATH
 
 // Configure the LED pins as outputs (driven low). Safe to call once at boot.
 // Does NOT touch the heater/fan pins — those are owned by pb_heater/pb_fan,

@@ -168,6 +168,10 @@ static cJSON *state_json(const pb_policy_snapshot_t *s)
     cJSON *ptc = cJSON_AddObjectToObject(sensors, "ptc");
     add_num1(ptc, "temperature_c", s->ptc_c);
     cJSON_AddStringToObject(ptc, "status", ntc_status_str(s->ptc_status));
+    // U1 Breath bed probe (additive; "uninit"/null on boards without the channel).
+    cJSON *bed = cJSON_AddObjectToObject(sensors, "bed");
+    add_num1(bed, "temperature_c", s->bed_probe_c);
+    cJSON_AddStringToObject(bed, "status", ntc_status_str(s->bed_probe_status));
 
     cJSON *environment = cJSON_AddObjectToObject(o, "environment");
     // Active control source (klipper/bambu/ha). Read from NVS; since /setup reboots
@@ -214,6 +218,7 @@ static cJSON *state_json(const pb_policy_snapshot_t *s)
     add_num1(environment, "bed_target_c", s->bed_target_c);
     cJSON_AddBoolToObject(environment, "auto_engaged", s->auto_engaged);
     cJSON_AddBoolToObject(environment, "auto_filtering", s->auto_filtering);
+    cJSON_AddBoolToObject(environment, "probe_heat", s->probe_heat);
     // The Klipper [dragonbreath] helper is installed (mode-independent) so the
     // dashboard can warn AUTO is unavailable before arming; auto_blocked_by_helper
     // is the narrower "AUTO armed but held off right now" case.
@@ -247,6 +252,9 @@ static cJSON *state_json(const pb_policy_snapshot_t *s)
     cJSON_AddNumberToObject(pj, "dry_hours", s->params.dry_hours);
     add_num1(pj, "filter_temp_c", s->params.filter_temp_c);
     cJSON_AddBoolToObject(pj, "filter_auto_enable", s->params.filter_auto_enable);
+    cJSON_AddBoolToObject(pj, "probe_auto_enable", s->params.probe_auto_enable);
+    add_num1(pj, "probe_on_c", s->params.probe_on_c);
+    add_num1(pj, "probe_off_c", s->params.probe_off_c);
 
     cJSON *safety = cJSON_AddObjectToObject(o, "safety");
     cJSON_AddBoolToObject(safety, "fault_latched", s->fault_latched);
@@ -328,7 +336,11 @@ static esp_err_t info_get(httpd_req_t *req)
     cJSON *ui = cJSON_AddObjectToObject(o, "ui");
     cJSON_AddNumberToObject(ui, "schema", 1);
     cJSON_AddStringToObject(ui, "product", "dragonbreath");
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    cJSON_AddStringToObject(ui, "display_name", "U1 Breath");
+#else
     cJSON_AddStringToObject(ui, "display_name", "DragonBreath");
+#endif
     // Divider reference resistor resolved from the GPIO19 strap (diagnostic): 82 or
     // 33 kOhm; a board whose strap floats comes up at the fail-safe 33 kOhm default.
     cJSON_AddNumberToObject(o, "rref_kohm", pb_ntc_rref_kohm());
@@ -348,14 +360,24 @@ static esp_err_t info_get(httpd_req_t *req)
     // Release repo for the shared UI's update check (dc_ui reads update.repo +
     // update.asset_prefix, queries GitHub's latest release, and notifies if newer).
     cJSON *upd = cJSON_AddObjectToObject(o, "update");
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    // Never offer a Panda Breath image to a U1 Breath board: its pin map would
+    // drive the wrong GPIOs. The updater follows this project's own releases.
+    cJSON_AddStringToObject(upd, "repo", "magnaludus/hello-world");
+    cJSON_AddStringToObject(upd, "asset_prefix", "u1breath-");
+#else
     cJSON_AddStringToObject(upd, "repo", "plastikman/DragonBreath");
     cJSON_AddStringToObject(upd, "asset_prefix", "dragonbreath-");
+#endif
     cJSON *cap = cJSON_AddArrayToObject(o, "capabilities");
     cJSON_AddItemToArray(cap, cJSON_CreateString("power_on"));
     cJSON_AddItemToArray(cap, cJSON_CreateString("auto"));
     cJSON_AddItemToArray(cap, cJSON_CreateString("drying"));
     cJSON_AddItemToArray(cap, cJSON_CreateString("lease_heartbeat"));
     cJSON_AddItemToArray(cap, cJSON_CreateString("sse"));
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    cJSON_AddItemToArray(cap, cJSON_CreateString("bed_probe"));
+#endif
     return send_json(req, o);
 }
 
@@ -730,7 +752,7 @@ static esp_err_t settings_send(httpd_req_t *req)
     // Board's per-Rref foldback-cut default (shown as the slider's "auto" value).
     float fbdef_cut, fbdef_resume;
     pb_heater_foldback_thresholds(pb_ntc_rref_kohm(), &fbdef_cut, &fbdef_resume);
-    char buf[600];
+    char buf[900];
     int n = snprintf(buf, sizeof buf,
         "{\"max\":%.1f,\"max_min\":%.1f,\"max_abs\":%.1f,"
         "\"comms_ms\":%u,\"comms_ms_min\":%u,\"comms_ms_max\":%u,"
@@ -738,6 +760,8 @@ static esp_err_t settings_send(httpd_req_t *req)
         "\"fb_cut\":%.1f,\"fb_cut_default\":%.1f,\"fb_cut_min\":%.1f,\"fb_cut_max\":%.1f,"
         "\"filter_temp\":%.1f,\"filter_temp_min\":%.1f,\"filter_temp_max\":%.1f,"
         "\"filter_auto\":%s,"
+        "\"probe_auto\":%s,\"probe_on\":%.1f,\"probe_off\":%.1f,"
+        "\"probe_on_min\":%.1f,\"probe_on_max\":%.1f,\"probe_off_min\":%.1f,\"probe_gap_min\":%.1f,"
         "\"leds_enabled\":%s}",
         (double)pb_heater_get_max_target_c(),
         (double)PB_HEATER_MIN_TARGET_C,
@@ -756,6 +780,11 @@ static esp_err_t settings_send(httpd_req_t *req)
         (double)PB_POLICY_FILTER_TEMP_MIN_C,
         (double)PB_POLICY_FILTER_TEMP_MAX_C,
         pb_policy_get_filter_auto_enable() ? "true" : "false",
+        pb_policy_get_probe_auto_enable() ? "true" : "false",
+        (double)pb_policy_get_probe_on_c(),
+        (double)pb_policy_get_probe_off_c(),
+        (double)PB_POLICY_PROBE_ON_MIN_C, (double)PB_POLICY_PROBE_ON_MAX_C,
+        (double)PB_POLICY_PROBE_OFF_MIN_C, (double)PB_POLICY_PROBE_GAP_MIN_C,
         pb_leds_get_enabled() ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, n);
@@ -859,6 +888,29 @@ static esp_err_t settings_post(httpd_req_t *req)
             applied = true;
         }
     }
+    // U1 Breath bed-probe trigger: probe_auto / probe_on / probe_off may arrive in
+    // any combination; unspecified fields keep their current value and all three go
+    // through the one policy setter (range + hysteresis-gap check, persists).
+    {
+        char v2[24], v3[24];
+        bool have_pa = httpd_query_key_value(q, "probe_auto", v,  sizeof v)  == ESP_OK;
+        bool have_on = httpd_query_key_value(q, "probe_on",   v2, sizeof v2) == ESP_OK;
+        bool have_of = httpd_query_key_value(q, "probe_off",  v3, sizeof v3) == ESP_OK;
+        if (have_pa || have_on || have_of) {
+            bool  pa = pb_policy_get_probe_auto_enable();
+            float on = pb_policy_get_probe_on_c();
+            float of = pb_policy_get_probe_off_c();
+            if (have_pa) {
+                uint32_t en;
+                if (!parse_u32(v, &en)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad probe_auto"); return ESP_FAIL; }
+                pa = en != 0;
+            }
+            if (have_on && !parse_temp(v2, &on)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad probe_on"); return ESP_FAIL; }
+            if (have_of && !parse_temp(v3, &of)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad probe_off"); return ESP_FAIL; }
+            if (pb_policy_set_probe_config(pa, on, of) != PB_POLICY_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "probe_on/probe_off out of range (off must be at least 5 C below on)"); return ESP_FAIL; }
+            applied = true;
+        }
+    }
     if (httpd_query_key_value(q, "leds_enabled", v, sizeof v) == ESP_OK) {
         uint32_t on;
         if (!parse_u32(v, &on)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad leds_enabled"); return ESP_FAIL; }
@@ -868,7 +920,7 @@ static esp_err_t settings_post(httpd_req_t *req)
         applied = true;
     }
     if (!applied) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no known settings (max, comms_ms, cool_release, fb_cut, filter_temp, filter_auto, leds_enabled)");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no known settings (max, comms_ms, cool_release, fb_cut, filter_temp, filter_auto, probe_auto, probe_on, probe_off, leds_enabled)");
         return ESP_FAIL;
     }
     return settings_send(req);   // echo the clamped result
@@ -887,6 +939,9 @@ static esp_err_t calibration_send(httpd_req_t *req)
                     ? pb_ntc_smoothed_c(PB_NTC_CHAMBER) : NAN;
     float ptc_cal = pb_ntc_last_status(PB_NTC_PTC) == PB_NTC_OK
                     ? pb_ntc_smoothed_c(PB_NTC_PTC) : NAN;
+    float bed_off = pb_ntc_get_offset_c(PB_NTC_BED);
+    float bed_cal = pb_ntc_last_status(PB_NTC_BED) == PB_NTC_OK
+                    ? pb_ntc_smoothed_c(PB_NTC_BED) : NAN;
 
     cJSON *o = cJSON_CreateObject();
     if (!o) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
@@ -899,6 +954,9 @@ static esp_err_t calibration_send(httpd_req_t *req)
     add_num1(o, "ptc_c", ptc_cal);
     add_num1(o, "chamber_raw_c", isfinite(ch_cal)  ? ch_cal  - ch_off  : NAN);
     add_num1(o, "ptc_raw_c",     isfinite(ptc_cal) ? ptc_cal - ptc_off : NAN);
+    add_num1(o, "bed_offset_c", bed_off);
+    add_num1(o, "bed_c", bed_cal);
+    add_num1(o, "bed_raw_c", isfinite(bed_cal) ? bed_cal - bed_off : NAN);
     return send_json(req, o);
 }
 
@@ -935,10 +993,18 @@ static esp_err_t calibration_post(httpd_req_t *req)
         }
         applied = true;
     }
+    if (json_number(root, "bed_offset_c", &v) && PB_NTC_CHANNEL_COUNT > PB_NTC_BED) {
+        if (pb_ntc_set_offset_c(PB_NTC_BED, (float)v) != ESP_OK) {       // clamps + persists
+            cJSON_Delete(root);
+            return api_error(req, "500 Internal Server Error", "persist_failed",
+                             "could not save calibration", NULL);
+        }
+        applied = true;
+    }
     cJSON_Delete(root);
     if (!applied)
         return api_error(req, "400 Bad Request", "invalid_command",
-                         "chamber_offset_c and/or ptc_offset_c required", NULL);
+                         "chamber_offset_c, ptc_offset_c and/or bed_offset_c required", NULL);
     return calibration_send(req);   // echo the clamped offsets
 }
 

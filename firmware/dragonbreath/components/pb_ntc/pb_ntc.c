@@ -26,42 +26,43 @@ static const char *TAG = "pb_ntc";
 // (display/control) both return the one calibrated value. Raw-count fault
 // thresholds are unaffected — calibration cannot touch the fail-closed logic.
 #define PB_NTC_NVS_NS       "app_nvs"
-#define PB_NTC_KEY_OFF_CH   "ntc_off_ch"    // i32 centi-°C, chamber
-#define PB_NTC_KEY_OFF_PTC  "ntc_off_ptc"   // i32 centi-°C, PTC
+// i32 centi-°C per channel, indexed by pb_ntc_channel_t.
+static const char *const PB_NTC_KEY_OFF[] = { "ntc_off_ch", "ntc_off_ptc", "ntc_off_bed" };
 // PB_NTC_OFFSET_CENTI_MAX + pb_ntc_clamp_offset_centi() live in pb_ntc.h so the
 // loader, the setter and the host test all share one bound / one clamp.
 
-static _Atomic int s_offset_centi[2];       // [PB_NTC_CHAMBER], [PB_NTC_PTC]
+static _Atomic int s_offset_centi[PB_NTC_CHANNEL_COUNT];   // indexed by pb_ntc_channel_t
 
 static float ntc_offset_c(pb_ntc_channel_t ch)
 {
-    if (ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) return 0.0f;
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return 0.0f;
     return (float)atomic_load(&s_offset_centi[ch]) / 100.0f;
 }
 
 void pb_ntc_load_calibration(void)
 {
-    int32_t ch_centi = 0, ptc_centi = 0;
+    int32_t centi[PB_NTC_CHANNEL_COUNT] = { 0 };
     nvs_handle_t h;
     if (nvs_open(PB_NTC_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        int32_t v;
-        if (nvs_get_i32(h, PB_NTC_KEY_OFF_CH,  &v) == ESP_OK) ch_centi  = v;
-        if (nvs_get_i32(h, PB_NTC_KEY_OFF_PTC, &v) == ESP_OK) ptc_centi = v;
+        for (int i = 0; i < PB_NTC_CHANNEL_COUNT; ++i) {
+            int32_t v;
+            if (nvs_get_i32(h, PB_NTC_KEY_OFF[i], &v) == ESP_OK) centi[i] = v;
+        }
         nvs_close(h);
     }
     // Clamp on load through the SAME shared clamp as the setter: a corrupt /
     // out-of-range stored value must clamp to ±5 °C, never be applied raw.
-    ch_centi  = pb_ntc_clamp_offset_centi((int)ch_centi);
-    ptc_centi = pb_ntc_clamp_offset_centi((int)ptc_centi);
-    atomic_store(&s_offset_centi[PB_NTC_CHAMBER], (int)ch_centi);
-    atomic_store(&s_offset_centi[PB_NTC_PTC],     (int)ptc_centi);
+    for (int i = 0; i < PB_NTC_CHANNEL_COUNT; ++i) {
+        centi[i] = pb_ntc_clamp_offset_centi((int)centi[i]);
+        atomic_store(&s_offset_centi[i], (int)centi[i]);
+    }
     ESP_LOGI(TAG, "calibration loaded: chamber=%+.2fC ptc=%+.2fC",
-             ch_centi / 100.0, ptc_centi / 100.0);
+             centi[PB_NTC_CHAMBER] / 100.0, centi[PB_NTC_PTC] / 100.0);
 }
 
 esp_err_t pb_ntc_set_offset_c(pb_ntc_channel_t ch, float offset_c)
 {
-    if (ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) return ESP_ERR_INVALID_ARG;
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return ESP_ERR_INVALID_ARG;
     float clamped = pb_ntc_clamp_offset_c(offset_c);          // ±5 °C hard bound
     int centi = pb_ntc_clamp_offset_centi((int)lroundf(clamped * 100.0f));
 
@@ -75,8 +76,7 @@ esp_err_t pb_ntc_set_offset_c(pb_ntc_channel_t ch, float offset_c)
                  (int)ch, esp_err_to_name(err));
         return err;
     }
-    err = nvs_set_i32(h, ch == PB_NTC_CHAMBER ? PB_NTC_KEY_OFF_CH
-                                              : PB_NTC_KEY_OFF_PTC, centi);
+    err = nvs_set_i32(h, PB_NTC_KEY_OFF[ch], centi);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) {
@@ -94,15 +94,15 @@ float pb_ntc_get_offset_c(pb_ntc_channel_t ch) { return ntc_offset_c(ch); }
 #ifdef CONFIG_PB_DEVBOARD_SAFE
 
 static portMUX_TYPE s_hil_mux = portMUX_INITIALIZER_UNLOCKED;
-static float s_hil_temp[2];
-static pb_ntc_status_t s_hil_status[2];
-static pb_ntc_status_t s_last_status[2];
+static float s_hil_temp[PB_NTC_CHANNEL_COUNT];
+static pb_ntc_status_t s_hil_status[PB_NTC_CHANNEL_COUNT];
+static pb_ntc_status_t s_last_status[PB_NTC_CHANNEL_COUNT];
 static bool s_ready;
 
 void pb_ntc_hil_reset(void)
 {
     taskENTER_CRITICAL(&s_hil_mux);
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < PB_NTC_CHANNEL_COUNT; ++i) {
         s_hil_temp[i] = 25.0f;
         s_hil_status[i] = PB_NTC_OK;
         s_last_status[i] = PB_NTC_OK;
@@ -112,7 +112,7 @@ void pb_ntc_hil_reset(void)
 
 void pb_ntc_hil_set(pb_ntc_channel_t ch, pb_ntc_status_t status, float temp_c)
 {
-    if (ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) return;
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return;
     taskENTER_CRITICAL(&s_hil_mux);
     s_hil_status[ch] = status;
     s_hil_temp[ch] = temp_c;
@@ -130,7 +130,7 @@ esp_err_t pb_ntc_init(void)
 
 pb_ntc_status_t pb_ntc_read(pb_ntc_channel_t ch, float *out_c)
 {
-    if (!s_ready || ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) {
+    if (!s_ready || ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) {
         if (out_c) *out_c = NAN;
         return PB_NTC_UNINIT;
     }
@@ -146,7 +146,7 @@ pb_ntc_status_t pb_ntc_read(pb_ntc_channel_t ch, float *out_c)
 
 pb_ntc_status_t pb_ntc_last_status(pb_ntc_channel_t ch)
 {
-    if (ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) return PB_NTC_UNINIT;
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return PB_NTC_UNINIT;
     taskENTER_CRITICAL(&s_hil_mux);
     pb_ntc_status_t status = s_last_status[ch];
     taskEXIT_CRITICAL(&s_hil_mux);
@@ -155,7 +155,7 @@ pb_ntc_status_t pb_ntc_last_status(pb_ntc_channel_t ch)
 
 float pb_ntc_smoothed_c(pb_ntc_channel_t ch)
 {
-    if (!s_ready || ch < PB_NTC_CHAMBER || ch > PB_NTC_PTC) return NAN;
+    if (!s_ready || ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return NAN;
     taskENTER_CRITICAL(&s_hil_mux);
     float temp_c = s_hil_status[ch] == PB_NTC_OK ? s_hil_temp[ch] : NAN;
     taskEXIT_CRITICAL(&s_hil_mux);
@@ -183,6 +183,21 @@ int pb_ntc_rref_kohm(void) { return 82; }
 // pure pb_ntc_classify() helper and this read path share one definition.
 #define PB_AVG_WINDOW     5
 
+#ifdef CONFIG_PB_BOARD_U1BREATH
+// U1 Breath: three ordinary 100K / Beta 3950 NTCs (the Klipper-standard sensor),
+// each in a fixed 100k low-side divider. Beta-model conversion is within ~1 C of
+// a Steinhart-Hart fit over 20..110 C, which is all the safety logic needs.
+#define PB_NTC_R25_KOHM  100.0f
+#define PB_NTC_BETA      3950.0f
+#define PB_NTC_T25_K     298.15f
+
+static float rntc_to_temp_c(float r_kohm)
+{
+    if (!(r_kohm > 0.0f)) return NAN;
+    float inv_t = 1.0f / PB_NTC_T25_K + logf(r_kohm / PB_NTC_R25_KOHM) / PB_NTC_BETA;
+    return 1.0f / inv_t - 273.15f;
+}
+#else
 // R/T table, reverse-engineered verbatim from DROM @0x3c0e6638.
 // Index i corresponds to temperature (PB_RT_TEMP_BASE + i) degrees C.
 // Resistance (kOhm) is monotonically decreasing with temperature.
@@ -204,17 +219,22 @@ static const float PB_RT_R_KOHM[] = {
 #define PB_RT_N ((int)(sizeof(PB_RT_R_KOHM) / sizeof(PB_RT_R_KOHM[0])))
 
 static adc_oneshot_unit_handle_t s_adc;
-static adc_cali_handle_t s_cali[2];
+static adc_cali_handle_t s_cali[PB_NTC_CHANNEL_COUNT];
 static int s_rref_kohm;
 static bool s_ready;
 
 // moving-average state per channel
-static float s_win[2][PB_AVG_WINDOW];
-static int   s_win_cnt[2];
-static int   s_win_idx[2];
-static pb_ntc_status_t s_last_status[2] = { PB_NTC_UNINIT, PB_NTC_UNINIT };
+static float s_win[PB_NTC_CHANNEL_COUNT][PB_AVG_WINDOW];
+static int   s_win_cnt[PB_NTC_CHANNEL_COUNT];
+static int   s_win_idx[PB_NTC_CHANNEL_COUNT];
+static pb_ntc_status_t s_last_status[PB_NTC_CHANNEL_COUNT];   // set to UNINIT in pb_ntc_init
 
-static const adc_channel_t s_chan[2] = { PB_ADC_CH_CHAMBER, PB_ADC_CH_PTC };
+static const adc_channel_t s_chan[PB_NTC_CHANNEL_COUNT] = {
+    PB_ADC_CH_CHAMBER, PB_ADC_CH_PTC,
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    PB_ADC_CH_BED,
+#endif
+};
 
 // Resistance (kOhm) -> temperature (C), linear interpolation over the R/T table.
 // Interpolation is strictly better than the stock nearest-entry and stays <1C of it.
@@ -232,6 +252,7 @@ static float rntc_to_temp_c(float r_kohm)
     }
     return NAN; // unreachable
 }
+#endif // CONFIG_PB_BOARD_U1BREATH
 
 static float push_average(pb_ntc_channel_t ch, float v)
 {
@@ -256,7 +277,8 @@ esp_err_t pb_ntc_init(void)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < PB_NTC_CHANNEL_COUNT; i++) {
+        s_last_status[i] = PB_NTC_UNINIT;
         err = adc_oneshot_config_channel(s_adc, s_chan[i], &chan_cfg);
         if (err != ESP_OK) return err;
 
@@ -295,7 +317,7 @@ pb_ntc_status_t pb_ntc_read(pb_ntc_channel_t ch, float *out_c)
     float t = NAN;
 
     do {
-        if (!s_ready) { st = PB_NTC_UNINIT; break; }
+        if (!s_ready || ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) { st = PB_NTC_UNINIT; break; }
         int raw = 0;
         if (adc_oneshot_read(s_adc, s_chan[ch], &raw) != ESP_OK) { st = PB_NTC_UNINIT; break; }
         int mv = 0;
@@ -310,15 +332,20 @@ pb_ntc_status_t pb_ntc_read(pb_ntc_channel_t ch, float *out_c)
         st = PB_NTC_OK;
     } while (0);
 
-    s_last_status[ch] = st;
+    if (ch >= PB_NTC_CHAMBER && ch < PB_NTC_CHANNEL_COUNT) s_last_status[ch] = st;
     if (out_c) *out_c = t;                            // instantaneous (NAN on fault)
     return st;
 }
 
-pb_ntc_status_t pb_ntc_last_status(pb_ntc_channel_t ch) { return s_last_status[ch]; }
+pb_ntc_status_t pb_ntc_last_status(pb_ntc_channel_t ch)
+{
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return PB_NTC_UNINIT;
+    return s_last_status[ch];
+}
 
 float pb_ntc_smoothed_c(pb_ntc_channel_t ch)
 {
+    if (ch < PB_NTC_CHAMBER || ch >= PB_NTC_CHANNEL_COUNT) return NAN;
     if (!s_ready || s_win_cnt[ch] == 0) return NAN;
     float sum = 0.0f;
     for (int i = 0; i < s_win_cnt[ch]; i++) sum += s_win[ch][i];

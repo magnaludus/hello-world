@@ -33,6 +33,8 @@ static float chamber_c = 25.0f;
 static float ptc_c = 25.0f;
 static pb_ntc_status_t chamber_status = PB_NTC_OK;
 static pb_ntc_status_t ptc_status = PB_NTC_OK;
+static float bed_probe_c = 25.0f;                      // U1 Breath bed probe channel
+static pb_ntc_status_t bed_probe_status = PB_NTC_OK;
 
 #define CHECK(expr) do { \
     if (!(expr)) { \
@@ -205,11 +207,13 @@ static bool nvs_has(const char *key) { return nvs_slot(key, false) >= 0; }
 
 pb_ntc_status_t pb_ntc_last_status(pb_ntc_channel_t channel)
 {
+    if (channel == PB_NTC_BED) return bed_probe_status;
     return channel == PB_NTC_CHAMBER ? chamber_status : ptc_status;
 }
 
 float pb_ntc_smoothed_c(pb_ntc_channel_t channel)
 {
+    if (channel == PB_NTC_BED) return bed_probe_c;
     return channel == PB_NTC_CHAMBER ? chamber_c : ptc_c;
 }
 
@@ -244,6 +248,8 @@ static void reset_fixture(void)
     ptc_c = 25.0f;
     chamber_status = PB_NTC_OK;
     ptc_status = PB_NTC_OK;
+    bed_probe_c = 25.0f;
+    bed_probe_status = PB_NTC_OK;
     CHECK(pb_policy_init() == ESP_OK);
     pb_policy_set_wake_cb(count_wake);
 }
