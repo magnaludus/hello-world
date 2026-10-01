@@ -33,9 +33,9 @@ Air moves bottom to top. Y = 0 is the back face on the rear wall, +Y faces the c
 
 | Section | Stack (mm) | Total |
 |---|---|---|
-| Filter bay | back 3 + plenum 12 + HEPA 15 + carbon 15 + grille 3 | 48 |
+| Filter bay | back 3 + plenum 12 + retainer 3 + HEPA 15 + carbon 15 + grille 3 + lip 2 | 53 |
 | Blower / electronics | back 3 + blower 30 + inlet gap 12 + cover 3 | 48 |
-| Heater | back 3 + gap 8 + liner 1 + plenum 8 + element 32 + flange 1 | 53 |
+| Heater | back 3 + gap 8 + liner 1 + plenum 8 + element 32 + liner 1 + outlet plate 1 | 54 |
 
 The heater section sets the depth. A 300 W element deeper than 34 mm does not fit;
 put the real element dimensions in `cad/u1breath/params.py` and the envelope test
