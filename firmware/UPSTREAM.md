@@ -22,6 +22,7 @@ unchanged:
 | Buttons | 4 | XIAO BOOT on GPIO9 (short: AUTO/OFF toggle, 2 s: panic-off, 5 s: factory reset) |
 | AUTO | printer filament zone via Moonraker | plus a local bed-probe trigger with hysteresis |
 | Console | UART0 on GPIO21/20 | native USB Serial/JTAG |
+| Extra component | none | `components/led_strip` vendored from idf-extra-components (Apache-2.0) |
 
 ## Pulling upstream
 

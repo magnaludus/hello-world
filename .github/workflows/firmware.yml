@@ -1,10 +1,11 @@
 name: firmware
 
+# pull_request only: a push to a PR branch already triggers this, and a second
+# push-event run would only double the failure emails.
 on:
-  push:
-    paths: ["firmware/**", ".github/workflows/firmware.yml"]
   pull_request:
     paths: ["firmware/**", ".github/workflows/firmware.yml"]
+  workflow_dispatch:
 
 jobs:
   host-tests:
