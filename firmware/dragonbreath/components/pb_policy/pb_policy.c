@@ -1,0 +1,1383 @@
+// SPDX-License-Identifier: MIT
+#include "pb_policy.h"
+
+#include "pb_fan.h"
+#include "pb_heater.h"
+#include "pb_ntc.h"
+#include "pb_leds.h"
+#include "pb_buttons.h"
+#include "dc_evlog.h"
+
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "nvs.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+static const char *TAG = "pb_policy";
+
+// Session-gated residual-heat purge: after heat ran this boot, keep the fan on
+// while the chamber OR PTC is hot, with hysteresis (engage at >= release+HYST,
+// release only once BOTH are < the configured "cool down to" temperature).
+// Session-gated (heated_this_session) so the fan NEVER auto-starts on temperature
+// alone — and because that flag is RAM-only, a power-cycle-while-hot does NOT spin
+// the fan. The release temp is user-configurable (pb_heater_get_cool_release_c);
+// raise it for a hot room where the sensors can't reach the default.
+#define PB_PURGE_HYSTERESIS_C        3.0f
+#define PB_AUTO_BED_HYSTERESIS_C     3.0f
+#define PB_DRYING_MAX_HOURS         12U
+#define PB_MIN_MODE_TARGET_C        30.0f
+
+// --- Remembered mode parameters (the only reboot-surviving policy state) -----
+#define PB_NVS_NAMESPACE            "app_nvs"
+#define PB_NVS_KEY_MANUAL           "md_last"
+#define PB_NVS_KEY_AUTO_TGT         "md_auto_tgt"
+#define PB_NVS_KEY_AUTO_BED         "md_auto_bed"
+#define PB_NVS_KEY_DRY_TGT          "md_dry_tgt"
+#define PB_NVS_KEY_DRY_HRS          "md_dry_hrs"
+#define PB_NVS_KEY_FILT_TMP         "md_filt_tmp"
+#define PB_NVS_KEY_FILT_EN          "md_filt_en"
+#define PB_NVS_KEY_PRB_EN           "md_prb_en"
+#define PB_NVS_KEY_PRB_ON           "md_prb_on"
+#define PB_NVS_KEY_PRB_OFF          "md_prb_off"
+
+#define PB_AUTO_BED_MIN_C           40.0f
+#define PB_AUTO_BED_MAX_C          120.0f
+
+// AUTO fan-only filtration band bounds live in pb_policy.h (shared with the HTTP
+// settings JSON). Stock default is 30 C; the range sits below the AUTO heat-engage
+// threshold (min 40 C) so the band never demands heat.
+#define PB_DEFAULT_MANUAL_TARGET_C  50.0f
+#define PB_DEFAULT_AUTO_TARGET_C    60.0f
+#define PB_DEFAULT_AUTO_BED_C      100.0f
+#define PB_DEFAULT_DRY_TARGET_C     60.0f
+#define PB_DEFAULT_DRY_HOURS        12U
+#ifdef CONFIG_PB_BOARD_U1BREATH
+// U1 Breath: the bed probe is the whole point of the standalone mode, so the
+// local trigger and the filtration band ship ON. 45 C filters every print
+// (PLA beds run 50-60 C); 90/70 C heats only for ABS/ASA/PC class beds.
+#define PB_DEFAULT_FILTER_TEMP_C    45.0f
+#define PB_DEFAULT_FILTER_AUTO_EN   true
+#define PB_DEFAULT_PROBE_AUTO_EN    true
+#else
+#define PB_DEFAULT_FILTER_TEMP_C    30.0f
+#define PB_DEFAULT_FILTER_AUTO_EN   false   // opt-in (diverges from stock, which
+                                            // filters by default) — see OEM_PARITY.md
+#define PB_DEFAULT_PROBE_AUTO_EN    false   // no bed probe channel on the Panda
+#endif
+#define PB_DEFAULT_PROBE_ON_C       90.0f
+#define PB_DEFAULT_PROBE_OFF_C      70.0f
+
+typedef struct {
+    pb_mode_t mode;
+    db_source_t source;
+    uint32_t revision;
+
+    // #72: one-off manual-override memory (RAM-only, never persisted, not in the
+    // snapshot). When a POWER_ON run replaces AUTO, this remembers AUTO so the
+    // run's natural completion or an on-device stop returns to AUTO "waiting"
+    // instead of OFF. PB_MODE_OFF = no resume; explicit OFF and every safety path
+    // clear it, so only a run ending as a run can revert.
+    pb_mode_t resume_mode;
+
+    float requested_target_c;
+    uint8_t requested_fan_percent;
+
+    bool mk_connected;
+    bool klipper_helper_present; // Klipper [dragonbreath] helper is installed (an
+                                 // active manual controller) -> AUTO must not heat
+    float bed_c;          // measured bed temperature (display only)
+    float bed_target_c;   // commanded bed setpoint (AUTO/filter trigger)
+    float auto_bed_threshold_c;
+    bool auto_engaged;
+    bool auto_filtering;         // AUTO fan-only band latch (blower on, no heat)
+    bool probe_heat;             // local bed-probe hysteresis latch (AUTO only)
+    float src_target_c;          // source-requested chamber target (e.g. Bambu filament
+                                 // zone); 0 = none. When >0 in AUTO it engages heat to
+                                 // this target directly, bypassing the bed threshold.
+    float chamber_src_c;         // printer-reported chamber temperature;
+                                 // NAN = unavailable; used for regulation when
+                                 // the external source is live
+
+    int64_t drying_deadline_us;
+    int64_t local_power_deadline_us;
+
+    bool lease_active;
+    pb_policy_lease_t lease;
+    char lease_owner[PB_POLICY_OWNER_LEN + 1];
+    int64_t lease_deadline_us;
+
+    bool heated_this_session;
+    bool last_cooldown;          // hysteresis memory for the residual-heat purge
+    bool last_faulted;
+
+    pb_policy_params_t params;   // remembered mode parameters
+    bool params_dirty;           // params differ from what is on flash
+} policy_state_t;
+
+static SemaphoreHandle_t s_lock;
+static policy_state_t s;
+
+// Owned exclusively by the persistence worker: the last values successfully
+// committed, so only genuinely changed keys are rewritten (flash wear).
+static pb_policy_params_t s_written;
+static bool s_written_valid;
+static TaskHandle_t s_persist_task;
+
+static pb_policy_wake_fn s_wake_cb;
+
+void pb_policy_set_wake_cb(pb_policy_wake_fn fn) { s_wake_cb = fn; }
+
+static void wake_control_task(void)
+{
+    if (s_wake_cb) s_wake_cb();
+}
+
+static bool source_is_remote(db_source_t source)
+{
+    return source == DB_SOURCE_WEB || source == DB_SOURCE_KLIPPER;
+}
+
+static void copy_text(char *dst, size_t dst_size, const char *src)
+{
+    if (!dst || dst_size == 0) return;
+    snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
+static void revision_advance_locked(db_source_t source)
+{
+    // Reserve zero as "no snapshot received".  Natural uint32 rollover remains
+    // valid; skip zero so clients never confuse it with an uninitialized value.
+    s.revision++;
+    if (s.revision == 0) s.revision = 1;
+    s.source = source;
+}
+
+static void lease_invalidate_locked(void)
+{
+    s.lease_active = false;
+    memset(&s.lease, 0, sizeof s.lease);
+    s.lease_owner[0] = '\0';
+    s.lease_deadline_us = 0;
+}
+
+static int64_t remote_lease_ttl_us(void)
+{
+    return (int64_t)pb_heater_get_comms_timeout_ms() * 1000;
+}
+
+static void lease_issue_locked(const char *owner, int64_t now_us,
+                               pb_policy_lease_t *out)
+{
+    uint8_t random[PB_POLICY_LEASE_ID_LEN / 2];
+    esp_fill_random(random, sizeof random);
+    for (size_t i = 0; i < sizeof random; ++i) {
+        snprintf(&s.lease.id[i * 2], 3, "%02x", random[i]);
+    }
+    s.lease.id[PB_POLICY_LEASE_ID_LEN] = '\0';
+    copy_text(s.lease_owner, sizeof s.lease_owner,
+              owner && owner[0] ? owner : "remote");
+    s.lease_deadline_us = now_us + remote_lease_ttl_us();
+    s.lease_active = true;
+    if (out) *out = s.lease;
+}
+
+static bool revision_matches_locked(uint32_t expected)
+{
+    return expected == PB_POLICY_REVISION_ANY || expected == s.revision;
+}
+
+static pb_policy_result_t heat_precheck_locked(float target_c,
+                                                uint32_t expected_revision)
+{
+    if (!revision_matches_locked(expected_revision))
+        return PB_POLICY_REVISION_CONFLICT;
+    if (!isfinite(target_c) || target_c < PB_MIN_MODE_TARGET_C)
+        return PB_POLICY_INVALID;
+    if (pb_heater_is_inhibited())
+        return PB_POLICY_INHIBITED;
+    if (pb_heater_is_faulted())
+        return PB_POLICY_FAULT_LATCHED;
+    return PB_POLICY_OK;
+}
+
+static void set_off_locked(db_source_t source)
+{
+    // Target zero is accepted even while faulted/inhibited.
+    (void)pb_heater_set_target_c(0.0f);
+    s.mode = PB_MODE_OFF;
+    s.requested_target_c = 0.0f;
+    s.auto_engaged = false;
+    s.drying_deadline_us = 0;
+    s.local_power_deadline_us = 0;
+    s.resume_mode = PB_MODE_OFF;   // #72: explicit/hard OFF never reverts
+    s.probe_heat = false;
+    lease_invalidate_locked();
+    revision_advance_locked(source);
+}
+
+// #72: end a POWER_ON run. If it was a one-off override of AUTO, return to AUTO
+// "waiting" (re-armed from the remembered params); otherwise drop to OFF. Explicit
+// OFF and every safety path use set_off_locked directly (which clears resume_mode),
+// so only a run's natural completion or an on-device stop can revert here.
+static void restore_or_off_locked(db_source_t source)
+{
+    if (s.resume_mode != PB_MODE_AUTO) {
+        set_off_locked(source);
+        return;
+    }
+    (void)pb_heater_set_target_c(0.0f);   // AUTO "waiting" applies no heat until engaged
+    s.mode = PB_MODE_AUTO;
+    s.requested_target_c = s.params.auto_target_c;         // remembered, already clamped
+    s.auto_bed_threshold_c = s.params.auto_bed_threshold_c;
+    s.auto_engaged = false;
+    s.auto_filtering = false;
+    s.probe_heat = false;
+    s.drying_deadline_us = 0;
+    s.local_power_deadline_us = 0;
+    s.resume_mode = PB_MODE_OFF;
+    lease_invalidate_locked();
+    revision_advance_locked(source);
+}
+
+// --- Remembered mode parameters ---------------------------------------------
+// Parameters are the ONLY policy state that survives a reboot. Mode, target,
+// deadlines, and leases deliberately do not: the device always boots OFF.
+
+static uint32_t c_to_centi(float c) { return (uint32_t)lroundf(c * 100.0f); }
+static float centi_to_c(uint32_t centi) { return (float)centi / 100.0f; }
+
+// Missing values retain the defaults installed by pb_policy_init(). Stored
+// temperatures are clamped to their safe envelope; non-finite values fall back
+// to the default defensively.
+static float clamp_or_default(float v, float lo, float hi, float dflt)
+{
+    if (!isfinite(v)) v = dflt;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void params_clamp(pb_policy_params_t *p)
+{
+    // pb_heater_load_config() runs before pb_policy_load_params(), so use the
+    // live configured ceiling here. This keeps remembered/UI-prefill values
+    // inside a user-lowered maximum immediately after boot, not merely when a
+    // later command is submitted.
+    float max_target_c = clamp_or_default(
+        pb_heater_get_max_target_c(), PB_MIN_MODE_TARGET_C,
+        PB_HEATER_ABS_MAX_TARGET_C, PB_HEATER_ABS_MAX_TARGET_C);
+    p->manual_target_c = clamp_or_default(
+        p->manual_target_c, PB_MIN_MODE_TARGET_C,
+        max_target_c, PB_DEFAULT_MANUAL_TARGET_C);
+    p->auto_target_c = clamp_or_default(
+        p->auto_target_c, PB_MIN_MODE_TARGET_C,
+        max_target_c, PB_DEFAULT_AUTO_TARGET_C);
+    p->auto_bed_threshold_c = clamp_or_default(
+        p->auto_bed_threshold_c, PB_AUTO_BED_MIN_C,
+        PB_AUTO_BED_MAX_C, PB_DEFAULT_AUTO_BED_C);
+    p->dry_target_c = clamp_or_default(
+        p->dry_target_c, PB_MIN_MODE_TARGET_C,
+        max_target_c, PB_DEFAULT_DRY_TARGET_C);
+    if (p->dry_hours == 0 || p->dry_hours > PB_DRYING_MAX_HOURS)
+        p->dry_hours = PB_DEFAULT_DRY_HOURS;
+    p->filter_temp_c = clamp_or_default(
+        p->filter_temp_c, PB_POLICY_FILTER_TEMP_MIN_C,
+        PB_POLICY_FILTER_TEMP_MAX_C, PB_DEFAULT_FILTER_TEMP_C);
+    p->probe_on_c = clamp_or_default(
+        p->probe_on_c, PB_POLICY_PROBE_ON_MIN_C,
+        PB_POLICY_PROBE_ON_MAX_C, PB_DEFAULT_PROBE_ON_C);
+    p->probe_off_c = clamp_or_default(
+        p->probe_off_c, PB_POLICY_PROBE_OFF_MIN_C,
+        p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C, PB_DEFAULT_PROBE_OFF_C);
+    if (p->probe_off_c > p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C)   // default itself out of band
+        p->probe_off_c = p->probe_on_c - PB_POLICY_PROBE_GAP_MIN_C;
+}
+
+static void params_defaults_locked(void)
+{
+    s.params.manual_target_c      = PB_DEFAULT_MANUAL_TARGET_C;
+    s.params.auto_target_c        = PB_DEFAULT_AUTO_TARGET_C;
+    s.params.auto_bed_threshold_c = PB_DEFAULT_AUTO_BED_C;
+    s.params.dry_target_c         = PB_DEFAULT_DRY_TARGET_C;
+    s.params.dry_hours            = PB_DEFAULT_DRY_HOURS;
+    s.params.filter_temp_c        = PB_DEFAULT_FILTER_TEMP_C;
+    s.params.filter_auto_enable   = PB_DEFAULT_FILTER_AUTO_EN;
+    s.params.probe_auto_enable    = PB_DEFAULT_PROBE_AUTO_EN;
+    s.params.probe_on_c           = PB_DEFAULT_PROBE_ON_C;
+    s.params.probe_off_c          = PB_DEFAULT_PROBE_OFF_C;
+}
+
+// Wake the persistence worker. Call AFTER releasing s_lock: NVS writes must
+// never happen under the control mutex.
+static void params_notify(void)
+{
+    if (s_persist_task) xTaskNotifyGive(s_persist_task);
+}
+
+// Only the persistence worker (or the host test) reaches this, so writes are
+// serialized by construction: there is exactly one writer, and it always writes
+// the latest canonical snapshot. Concurrent HTTP/button commands therefore
+// cannot land on flash out of order.
+static esp_err_t persist_params(const pb_policy_params_t *p)
+{
+    const struct { const char *key; uint32_t val, prev; } kv[] = {
+        { PB_NVS_KEY_MANUAL,   c_to_centi(p->manual_target_c),
+                               c_to_centi(s_written.manual_target_c) },
+        { PB_NVS_KEY_AUTO_TGT, c_to_centi(p->auto_target_c),
+                               c_to_centi(s_written.auto_target_c) },
+        { PB_NVS_KEY_AUTO_BED, c_to_centi(p->auto_bed_threshold_c),
+                               c_to_centi(s_written.auto_bed_threshold_c) },
+        { PB_NVS_KEY_DRY_TGT,  c_to_centi(p->dry_target_c),
+                               c_to_centi(s_written.dry_target_c) },
+        { PB_NVS_KEY_DRY_HRS,  p->dry_hours, s_written.dry_hours },
+        { PB_NVS_KEY_FILT_TMP, c_to_centi(p->filter_temp_c),
+                               c_to_centi(s_written.filter_temp_c) },
+        { PB_NVS_KEY_FILT_EN,  p->filter_auto_enable ? 1u : 0u,
+                               s_written.filter_auto_enable ? 1u : 0u },
+        { PB_NVS_KEY_PRB_EN,   p->probe_auto_enable ? 1u : 0u,
+                               s_written.probe_auto_enable ? 1u : 0u },
+        { PB_NVS_KEY_PRB_ON,   c_to_centi(p->probe_on_c),
+                               c_to_centi(s_written.probe_on_c) },
+        { PB_NVS_KEY_PRB_OFF,  c_to_centi(p->probe_off_c),
+                               c_to_centi(s_written.probe_off_c) },
+    };
+    const size_t n = sizeof kv / sizeof kv[0];
+
+    bool any = !s_written_valid;
+    for (size_t i = 0; !any && i < n; ++i)
+        if (kv[i].val != kv[i].prev) any = true;
+    if (!any) return ESP_OK;   // nothing actually changed -- spare the flash
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(PB_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    for (size_t i = 0; i < n; ++i) {
+        if (s_written_valid && kv[i].val == kv[i].prev) continue;
+        esp_err_t e = nvs_set_u32(h, kv[i].key, kv[i].val);
+        if (e != ESP_OK && err == ESP_OK) err = e;
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        s_written = *p;
+        s_written_valid = true;
+    }
+    return err;
+}
+
+bool pb_policy_persist_pending(void)
+{
+    if (!s_lock) return false;
+
+    pb_policy_params_t p;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool dirty = s.params_dirty;
+    p = s.params;                 // canonical post-clamp values, never raw input
+    if (dirty) s.params_dirty = false;
+    xSemaphoreGive(s_lock);
+    if (!dirty) return false;
+
+    esp_err_t err = persist_params(&p);
+    if (err != ESP_OK) {
+        // Stay dirty so the next accepted command retries. A command that landed
+        // while we were writing may re-dirty this too; an extra no-op pass is
+        // harmless.
+        ESP_LOGE(TAG, "params persist failed (%d); will retry on next change",
+                 (int)err);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s.params_dirty = true;
+        xSemaphoreGive(s_lock);
+    }
+    return true;
+}
+
+static void persist_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        pb_policy_persist_pending();
+    }
+}
+
+void pb_policy_load_params(void)
+{
+    if (!s_lock) return;
+
+    pb_policy_params_t p;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    p = s.params;                 // defaults installed by pb_policy_init()
+    xSemaphoreGive(s_lock);
+
+    nvs_handle_t h;
+    if (nvs_open(PB_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint32_t v;
+        if (nvs_get_u32(h, PB_NVS_KEY_MANUAL, &v) == ESP_OK)
+            p.manual_target_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_AUTO_TGT, &v) == ESP_OK)
+            p.auto_target_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_AUTO_BED, &v) == ESP_OK)
+            p.auto_bed_threshold_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_DRY_TGT, &v) == ESP_OK)
+            p.dry_target_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_DRY_HRS, &v) == ESP_OK)
+            p.dry_hours = v > UINT8_MAX ? UINT8_MAX : (uint8_t)v;
+        if (nvs_get_u32(h, PB_NVS_KEY_FILT_TMP, &v) == ESP_OK)
+            p.filter_temp_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_FILT_EN, &v) == ESP_OK)
+            p.filter_auto_enable = (v != 0);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_EN, &v) == ESP_OK)
+            p.probe_auto_enable = (v != 0);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_ON, &v) == ESP_OK)
+            p.probe_on_c = centi_to_c(v);
+        if (nvs_get_u32(h, PB_NVS_KEY_PRB_OFF, &v) == ESP_OK)
+            p.probe_off_c = centi_to_c(v);
+        nvs_close(h);
+    }
+    params_clamp(&p);
+
+    // Parameters only. Mode, target, deadlines, and leases are untouched, so
+    // this cannot arm heat -- the device stays OFF exactly as init left it.
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s.params = p;
+    s.params_dirty = false;
+    xSemaphoreGive(s_lock);
+
+    s_written = p;
+    s_written_valid = true;
+
+    if (!s_persist_task &&
+        xTaskCreate(persist_task, "pb_pol_persist", 2560, NULL, 2,
+                    &s_persist_task) != pdPASS) {
+        s_persist_task = NULL;
+        ESP_LOGE(TAG, "persistence worker did not start; params stay RAM-only");
+    }
+    ESP_LOGI(TAG,
+        "params loaded: manual=%.1fC auto=%.1fC/bed%.1fC dry=%.1fC/%uh",
+        p.manual_target_c, p.auto_target_c, p.auto_bed_threshold_c,
+        p.dry_target_c, (unsigned)p.dry_hours);
+}
+
+void pb_policy_get_params(pb_policy_params_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    *out = s.params;
+    xSemaphoreGive(s_lock);
+}
+
+esp_err_t pb_policy_init(void)
+{
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) return ESP_ERR_NO_MEM;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memset(&s, 0, sizeof s);
+    s.mode = PB_MODE_OFF;
+    s.source = DB_SOURCE_BOOT;
+    s.revision = 1;
+    s.auto_bed_threshold_c = PB_DEFAULT_AUTO_BED_C;
+    s.last_faulted = pb_heater_is_faulted();
+    params_defaults_locked();
+    xSemaphoreGive(s_lock);
+    s_written_valid = false;   // nothing known about flash until load_params()
+
+    // The heater was forced off before policy initialization.  Do not restore
+    // mode, target, deadlines, or leases from storage.
+    (void)pb_heater_set_target_c(0.0f);
+    ESP_LOGI(TAG, "authoritative state initialized: OFF revision=1");
+    return ESP_OK;
+}
+
+pb_policy_result_t pb_policy_set_power_on(
+    float target_c,
+    db_source_t source,
+    const char *owner,
+    uint32_t expected_revision,
+    pb_policy_lease_t *lease_out)
+{
+    if (!s_lock) return PB_POLICY_INHIBITED;
+    if (lease_out) memset(lease_out, 0, sizeof *lease_out);
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pb_policy_result_t r = heat_precheck_locked(target_c, expected_revision);
+    if (r != PB_POLICY_OK) {
+        xSemaphoreGive(s_lock);
+        return r;
+    }
+
+    esp_err_t hr = pb_heater_set_target_c(target_c);
+    if (hr != ESP_OK) {
+        r = hr == ESP_ERR_INVALID_STATE
+            ? PB_POLICY_FAULT_LATCHED : PB_POLICY_INVALID;
+        xSemaphoreGive(s_lock);
+        return r;
+    }
+
+    int64_t now = esp_timer_get_time();
+    // #72: a manual run started while AUTO is a one-off override — remember to
+    // return to AUTO "waiting" when it ends. From any other mode there is nothing
+    // to revert to.
+    pb_mode_t prev_mode = s.mode;
+    lease_invalidate_locked();
+    s.mode = PB_MODE_POWER_ON;
+    s.resume_mode = (prev_mode == PB_MODE_AUTO) ? PB_MODE_AUTO : PB_MODE_OFF;
+    s.requested_target_c = pb_heater_get_target_c(); // includes heater clamp
+    s.auto_engaged = false;
+    s.drying_deadline_us = 0;
+    s.local_power_deadline_us = 0;
+
+    if (source_is_remote(source)) {
+        lease_issue_locked(owner, now, lease_out);
+        pb_heater_notify_link_alive();
+    } else {
+        s.local_power_deadline_us =
+            now + (int64_t)PB_POLICY_LOCAL_POWER_MAX_MS * 1000;
+    }
+    revision_advance_locked(source);
+    s.params.manual_target_c = s.requested_target_c;   // post-clamp
+    s.params_dirty = true;
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    params_notify();
+    return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_set_auto(
+    float target_c,
+    float bed_threshold_c,
+    db_source_t source,
+    uint32_t expected_revision)
+{
+    if (!s_lock || !isfinite(bed_threshold_c)
+            || bed_threshold_c < 40.0f || bed_threshold_c > 120.0f)
+        return PB_POLICY_INVALID;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pb_policy_result_t r = heat_precheck_locked(target_c, expected_revision);
+    if (r != PB_POLICY_OK) {
+        xSemaphoreGive(s_lock);
+        return r;
+    }
+    lease_invalidate_locked();
+    s.mode = PB_MODE_AUTO;
+    s.resume_mode = PB_MODE_OFF;   // #72: an explicit AUTO command is not an override
+    float max_target_c = pb_heater_get_max_target_c();
+    s.requested_target_c =
+        target_c > max_target_c ? max_target_c : target_c;
+    s.auto_bed_threshold_c = bed_threshold_c;
+    s.auto_engaged = false;
+    s.auto_filtering = false;
+    s.drying_deadline_us = 0;
+    s.local_power_deadline_us = 0;
+    (void)pb_heater_set_target_c(0.0f);
+    revision_advance_locked(source);
+    s.params.auto_target_c = s.requested_target_c;     // post-clamp
+    s.params.auto_bed_threshold_c = bed_threshold_c;
+    s.params_dirty = true;
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    params_notify();
+    return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_start_drying(
+    float target_c,
+    uint8_t hours,
+    db_source_t source,
+    uint32_t expected_revision)
+{
+    if (!s_lock || hours == 0 || hours > PB_DRYING_MAX_HOURS)
+        return PB_POLICY_INVALID;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pb_policy_result_t r = heat_precheck_locked(target_c, expected_revision);
+    if (r != PB_POLICY_OK) {
+        xSemaphoreGive(s_lock);
+        return r;
+    }
+    esp_err_t hr = pb_heater_set_target_c(target_c);
+    if (hr != ESP_OK) {
+        r = hr == ESP_ERR_INVALID_STATE
+            ? PB_POLICY_FAULT_LATCHED : PB_POLICY_INVALID;
+        xSemaphoreGive(s_lock);
+        return r;
+    }
+    lease_invalidate_locked();
+    s.mode = PB_MODE_DRYING;
+    s.resume_mode = PB_MODE_OFF;   // #72: drying is not resumable; no revert to AUTO
+    s.requested_target_c = pb_heater_get_target_c();
+    s.auto_engaged = false;
+    s.local_power_deadline_us = 0;
+    s.drying_deadline_us = esp_timer_get_time()
+        + (int64_t)hours * 60 * 60 * 1000000;
+    revision_advance_locked(source);
+    s.params.dry_target_c = s.requested_target_c;      // post-clamp
+    s.params.dry_hours = hours;
+    s.params_dirty = true;
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    params_notify();
+    return PB_POLICY_OK;
+}
+
+void pb_policy_set_mode_off(db_source_t source)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+#ifdef CONFIG_PB_BOARD_U1BREATH
+    // Klipper's `M141 S0` ends KLIPPER'S run. On U1 Breath a local AUTO session
+    // (bed probe) commonly sits underneath a print's M141/M191 override, so that
+    // end-of-print OFF returns to AUTO "waiting" instead of killing the probe
+    // automation. Web/button/safety OFF remain hard OFF.
+    if (source == DB_SOURCE_KLIPPER && s.resume_mode == PB_MODE_AUTO)
+        restore_or_off_locked(source);
+    else
+        set_off_locked(source);
+#else
+    set_off_locked(source);
+#endif
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+}
+
+// #72: stop a manual run *as a run* (the on-device On-button toggle-off) — revert
+// to AUTO "waiting" if this run was a one-off override of AUTO, else OFF. This is
+// NOT the master-OFF path; the Power button and the `off` command stay hard OFF.
+static void pb_policy_stop_power_on(db_source_t source)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    restore_or_off_locked(source);
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+}
+
+// Manual filtration blower — run the chamber blower fan-only, heater untouched.
+// This is deliberately INDEPENDENT of the heat mode: it is not cleared by OFF and
+// does not change s.mode, so it can filter/purge air "out of band" while OFF, or
+// add airflow on top of any heat mode (whichever wants more air wins in the tick).
+// Fan-only has no heat path, so it is safe even while faulted (extra cooling) and
+// needs no revision gate. It never persists: the device always boots OFF, fan 0.
+pb_policy_result_t pb_policy_set_fan(uint8_t percent, db_source_t source)
+{
+    if (!s_lock) return PB_POLICY_INVALID;
+    if (percent > 100) percent = 100;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    // Manual filtration may only be ENABLED while idle. While the heater is heating
+    // (armed and not tripped, incl. through foldback cycling) or the residual-heat
+    // cooldown purge is running, the blower is owned by the safety-airflow logic, so
+    // a status-page toggle can't switch it ON and disturb the heat cycle. Turning it
+    // OFF (percent == 0) is always allowed — it can't reduce required airflow (the
+    // heat/cooldown path forces the fan on regardless) and it lets "Stop" clear a
+    // lingering filtration request mid-cycle. (heat_mode() called under s_lock, as
+    // pb_policy_tick does.)
+    if (percent > 0 && (pb_heater_heat_mode() || s.last_cooldown)) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_BUSY;
+    }
+    if (s.requested_fan_percent != percent) {
+        s.requested_fan_percent = percent;
+        revision_advance_locked(source);
+    }
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_set_filter_config(float filter_temp_c, bool enable)
+{
+    if (!s_lock || !isfinite(filter_temp_c)
+            || filter_temp_c < PB_POLICY_FILTER_TEMP_MIN_C
+            || filter_temp_c > PB_POLICY_FILTER_TEMP_MAX_C)
+        return PB_POLICY_INVALID;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s.params.filter_temp_c = filter_temp_c;
+    s.params.filter_auto_enable = enable;
+    s.params_dirty = true;
+    xSemaphoreGive(s_lock);
+    params_notify();
+    wake_control_task();      // re-evaluate the AUTO band on the next tick
+    return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_set_probe_config(bool enable, float on_c, float off_c)
+{
+    if (!s_lock || !isfinite(on_c) || !isfinite(off_c)
+            || on_c < PB_POLICY_PROBE_ON_MIN_C || on_c > PB_POLICY_PROBE_ON_MAX_C
+            || off_c < PB_POLICY_PROBE_OFF_MIN_C
+            || off_c > on_c - PB_POLICY_PROBE_GAP_MIN_C)
+        return PB_POLICY_INVALID;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s.params.probe_auto_enable = enable;
+    s.params.probe_on_c = on_c;
+    s.params.probe_off_c = off_c;
+    if (!enable) s.probe_heat = false;
+    s.params_dirty = true;
+    revision_advance_locked(DB_SOURCE_WEB);
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    params_notify();
+    return PB_POLICY_OK;
+}
+
+bool pb_policy_get_probe_auto_enable(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_AUTO_EN;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool v = s.params.probe_auto_enable;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+float pb_policy_get_probe_on_c(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_ON_C;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float v = s.params.probe_on_c;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+float pb_policy_get_probe_off_c(void)
+{
+    if (!s_lock) return PB_DEFAULT_PROBE_OFF_C;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float v = s.params.probe_off_c;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+float pb_policy_get_filter_temp_c(void)
+{
+    if (!s_lock) return PB_DEFAULT_FILTER_TEMP_C;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float v = s.params.filter_temp_c;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+bool pb_policy_get_filter_auto_enable(void)
+{
+    if (!s_lock) return PB_DEFAULT_FILTER_AUTO_EN;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool v = s.params.filter_auto_enable;
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+void pb_policy_stop_drying(db_source_t source)
+{
+    pb_policy_set_mode_off(source);
+}
+
+void pb_policy_set_env(
+    float bed_c,
+    float bed_target_c,
+    bool source_connected,
+    float src_target_c,
+    float chamber_src_c)
+{
+    if (!s_lock) return;
+
+    // Clamp the source-requested target to the settable ceiling; the fixed heater
+    // cutoffs (chamber/element over-temp) still protect regardless.
+    if (!isfinite(src_target_c) || src_target_c < 0.0f)
+        src_target_c = 0.0f;
+
+    if (src_target_c > PB_HEATER_ABS_MAX_TARGET_C)
+        src_target_c = PB_HEATER_ABS_MAX_TARGET_C;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    s.bed_c = isfinite(bed_c) ? bed_c : 0.0f;
+    s.bed_target_c = isfinite(bed_target_c) ? bed_target_c : 0.0f;
+    s.mk_connected = source_connected;
+    s.src_target_c = src_target_c;
+    s.chamber_src_c = isfinite(chamber_src_c) ? chamber_src_c : NAN;
+
+    xSemaphoreGive(s_lock);
+}
+
+void pb_policy_set_klipper_helper(bool present)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s.klipper_helper_present = present;
+    xSemaphoreGive(s_lock);
+}
+
+pb_policy_result_t pb_policy_heartbeat(const pb_policy_lease_t *lease)
+{
+    if (!s_lock || !lease || lease->id[0] == '\0')
+        return PB_POLICY_STALE_LEASE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!s.lease_active || strcmp(lease->id, s.lease.id) != 0
+            || s.mode != PB_MODE_POWER_ON) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_STALE_LEASE;
+    }
+    int64_t now = esp_timer_get_time();
+    if (now >= s.lease_deadline_us) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_STALE_LEASE;
+    }
+    s.lease_deadline_us = now + remote_lease_ttl_us();
+    pb_heater_notify_link_alive();
+    xSemaphoreGive(s_lock);
+    return PB_POLICY_OK;
+}
+
+pb_policy_result_t pb_policy_clear_fault(
+    db_source_t source,
+    uint32_t expected_revision)
+{
+    if (!s_lock) return PB_POLICY_INHIBITED;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!revision_matches_locked(expected_revision)) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_REVISION_CONFLICT;
+    }
+    if (pb_heater_is_inhibited()) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_INHIBITED;
+    }
+    // Persist-first clear: if the NVS clear fails the heater stays latched, so
+    // surface it (HTTP 500) instead of reporting the fault gone.
+    if (pb_heater_clear_fault() != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return PB_POLICY_PERSIST_FAILED;
+    }
+    s.last_faulted = false;
+    set_off_locked(source);
+    xSemaphoreGive(s_lock);
+    wake_control_task();
+    return PB_POLICY_OK;
+}
+
+void pb_policy_request_panic_off(db_source_t source, const char *reason)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    // Latch the heater without a GPIO write (this may not be the control task),
+    // then drive the full policy transition here so the tick's generic
+    // faulted-sync does NOT re-stamp it as SAFETY on the next pass.
+    pb_heater_request_panic_off(reason);
+    s.mode = PB_MODE_OFF;
+    s.requested_target_c = 0.0f;
+    s.auto_engaged = false;
+    s.drying_deadline_us = 0;
+    s.local_power_deadline_us = 0;
+    s.resume_mode = PB_MODE_OFF;   // #72: safety off never reverts
+    lease_invalidate_locked();
+    revision_advance_locked(source);
+    // Claim the fault edge so pb_policy_tick() sees last_faulted already true and
+    // skips its own SAFETY attribution / lease-invalidate for this transition.
+    s.last_faulted = true;
+    xSemaphoreGive(s_lock);
+
+    // Drop the SSR now rather than on the next periodic tick: the control task
+    // runs the full safety tick immediately on this notification.
+    wake_control_task();
+    // Keep logging after the wake: diagnostic I/O must never consume the
+    // panic-off latency budget.
+    ESP_LOGW(TAG, "panic-off requested: %s", reason ? reason : "(unspecified)");
+}
+
+static const char *button_str(pb_button_id_t id)
+{
+    switch (id) {
+        case PB_BUTTON_POWER: return "power";
+        case PB_BUTTON_AUTO:  return "auto";
+        case PB_BUTTON_ON:    return "on";
+        case PB_BUTTON_DRY:   return "dry";
+        default:              return "?";
+    }
+}
+
+// Toggle a mode: if already in `target_mode`, go OFF; otherwise arm it from the
+// remembered parameters. Runs the setter WITHOUT the policy lock (setters take
+// it themselves); source=BUTTON, revision-any (a physical actor always wins).
+static pb_policy_result_t button_toggle_mode(pb_mode_t target_mode)
+{
+    if (pb_policy_get_mode() == target_mode) {
+        // #72: toggling OFF a manual run reverts to AUTO "waiting" if it overrode
+        // AUTO; toggling off AUTO/DRY is a plain stop.
+        if (target_mode == PB_MODE_POWER_ON)
+            pb_policy_stop_power_on(DB_SOURCE_BUTTON);
+        else
+            pb_policy_set_mode_off(DB_SOURCE_BUTTON);
+        return PB_POLICY_OK;
+    }
+    pb_policy_params_t p;
+    pb_policy_get_params(&p);
+    switch (target_mode) {
+        case PB_MODE_POWER_ON:
+            return pb_policy_set_power_on(
+                p.manual_target_c, DB_SOURCE_BUTTON,
+                "button", PB_POLICY_REVISION_ANY, NULL);
+        case PB_MODE_AUTO:
+            return pb_policy_set_auto(
+                p.auto_target_c, p.auto_bed_threshold_c,
+                DB_SOURCE_BUTTON, PB_POLICY_REVISION_ANY);
+        case PB_MODE_DRYING:
+            return pb_policy_start_drying(
+                p.dry_target_c, p.dry_hours,
+                DB_SOURCE_BUTTON, PB_POLICY_REVISION_ANY);
+        default:
+            return PB_POLICY_INVALID;
+    }
+}
+
+void pb_policy_on_button(pb_button_id_t id, pb_button_event_t ev)
+{
+    if (!s_lock) return;
+
+    if (ev == PB_BUTTON_LONG) {
+        // Power long-press while faulted: attempt a recovery clear instead of a
+        // redundant panic. Any other long-press latches panic-off.
+        if (id == PB_BUTTON_POWER && pb_heater_is_faulted()) {
+            // A physical actor always wins, so revision-any is correct here.
+            pb_policy_result_t r =
+                pb_policy_clear_fault(DB_SOURCE_BUTTON, PB_POLICY_REVISION_ANY);
+            dc_evlog_add("btn: power long -> clear fault (%s)",
+                         pb_policy_result_str(r));
+            return;
+        }
+        pb_policy_request_panic_off(DB_SOURCE_BUTTON, "button panic-off");
+        // The event log can wait on its diagnostic mutex, so record only after
+        // the heater is latched off and the control task has been notified.
+        dc_evlog_add("btn: %s long -> panic-off", button_str(id));
+        return;
+    }
+
+    // SHORT press.
+    pb_policy_result_t r;
+    switch (id) {
+        case PB_BUTTON_ON:
+            r = button_toggle_mode(PB_MODE_POWER_ON);
+            if (r == PB_POLICY_OK) {
+                dc_evlog_add("btn: on -> %s",
+                             pb_policy_mode_str(pb_policy_get_mode()));
+            } else {
+                dc_evlog_add("btn: on rejected (%s)",
+                             pb_policy_result_str(r));
+            }
+            break;
+        case PB_BUTTON_AUTO:
+            r = button_toggle_mode(PB_MODE_AUTO);
+            if (r == PB_POLICY_OK) {
+                dc_evlog_add("btn: auto -> %s",
+                             pb_policy_mode_str(pb_policy_get_mode()));
+            } else {
+                dc_evlog_add("btn: auto rejected (%s)",
+                             pb_policy_result_str(r));
+            }
+            break;
+        case PB_BUTTON_DRY:
+            r = button_toggle_mode(PB_MODE_DRYING);
+            if (r == PB_POLICY_OK) {
+                dc_evlog_add("btn: dry -> %s",
+                             pb_policy_mode_str(pb_policy_get_mode()));
+            } else {
+                dc_evlog_add("btn: dry rejected (%s)",
+                             pb_policy_result_str(r));
+            }
+            break;
+        case PB_BUTTON_POWER:
+            // Master OFF. Already-off is a deliberate no-op: log it but do not
+            // bump the revision, so an idle tap does not churn observers.
+            if (pb_policy_get_mode() == PB_MODE_OFF) {
+#ifdef CONFIG_PB_BOARD_U1BREATH
+                // Single-button board: a tap while OFF arms AUTO (bed probe +
+                // Klipper follow); a tap in any mode is still master OFF.
+                r = button_toggle_mode(PB_MODE_AUTO);
+                if (r == PB_POLICY_OK)
+                    dc_evlog_add("btn: power -> %s", pb_policy_mode_str(pb_policy_get_mode()));
+                else
+                    dc_evlog_add("btn: power auto rejected (%s)", pb_policy_result_str(r));
+#else
+                dc_evlog_add("btn: power (already off)");
+#endif
+            } else {
+                pb_policy_set_mode_off(DB_SOURCE_BUTTON);
+                dc_evlog_add("btn: power -> off");
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+bool pb_purge_decide(bool heat, bool *heated_this_session,
+                     bool chamber_ok, float chamber_c,
+                     bool ptc_ok, float ptc_c, bool prev_cooldown,
+                     float release_c)
+{
+    if (heat) { *heated_this_session = true; return false; }  // heating: fan is heat's job
+    if (!*heated_this_session) return false;                  // never heated -> no temp-only purge
+
+    // The user-configurable "cool down to" temperature is the RELEASE point; engage
+    // is one hysteresis band above it.
+    const float latch_c = release_c + PB_PURGE_HYSTERESIS_C;
+    // Start the purge unless we can CONFIRM it's cool — i.e. unless BOTH sensors
+    // are known and below the latch temp. So a sensor that's hot, OR unknown right
+    // as heating ends, starts the fan (can't confirm cool -> fail safe) rather than
+    // only starting when a sensor actively reads >= the latch.
+    bool confirmed_cool = (chamber_ok && chamber_c < latch_c) &&
+                          (ptc_ok     && ptc_c     < latch_c);
+    // Release only once BOTH sensors are KNOWN below the release temp; an unknown
+    // (faulted) or still-hot sensor keeps the fan running (fail-safe).
+    bool both_cool = (chamber_ok && chamber_c < release_c) &&
+                     (ptc_ok     && ptc_c     < release_c);
+
+    bool cooldown = prev_cooldown ? !both_cool        // purging: keep on until both cool
+                                  : !confirmed_cool;  // idle: start unless confirmed cool
+    if (!cooldown) *heated_this_session = false;  // fully cooled -> end the session purge
+    return cooldown;
+}
+
+bool pb_probe_decide(bool probe_ok, float probe_c, float on_c, float off_c, bool prev)
+{
+    if (!probe_ok || !isfinite(probe_c)) return prev;
+    if (probe_c >= on_c)  return true;
+    if (probe_c <  off_c) return false;
+    return prev;
+}
+
+void pb_policy_tick(void)
+{
+    if (!s_lock) return;
+    int64_t now = esp_timer_get_time();
+    bool watchdog_trip = false;
+    bool local_limit_expired = false;
+    const char *watchdog_reason = NULL;
+    float target = 0.0f;
+    bool autonomous = false;
+    // Local bed probe (U1 Breath). NAN/UNINIT on boards without the channel, which
+    // simply disables every probe path below.
+    float probe_c = pb_ntc_smoothed_c(PB_NTC_BED);
+    bool probe_ok = pb_ntc_last_status(PB_NTC_BED) == PB_NTC_OK && isfinite(probe_c);
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    switch (s.mode) {
+        case PB_MODE_POWER_ON:
+            if (s.lease_active && now >= s.lease_deadline_us) {
+                watchdog_trip = true;
+                // The remote controller stopped heartbeating within the comms
+                // deadman, so fail safe. Name the likely cause per source: a web
+                // (dashboard) controller heartbeats from the page, which the browser
+                // throttles/stops when the tab is backgrounded or closed — the most
+                // common reason a manual web session "drops off." s.source still
+                // holds the controlling source here; the trip overwrites it to
+                // WATCHDOG afterward.
+                watchdog_reason = (s.source == DB_SOURCE_WEB)
+                    ? "Web controller lease expired - browser tab may be backgrounded"
+                    : "controller lease expired";
+            } else if (!s.lease_active && s.local_power_deadline_us > 0
+                       && now >= s.local_power_deadline_us) {
+                local_limit_expired = true;
+                // #72: an on-device timed manual run completing is the run "done" —
+                // revert to AUTO "waiting" if it overrode AUTO, else OFF.
+                restore_or_off_locked(DB_SOURCE_WATCHDOG);
+            } else {
+                target = s.requested_target_c;
+                autonomous = !s.lease_active;
+            }
+            break;
+
+        case PB_MODE_AUTO:
+        {
+            // AUTO follows the active print's FILAMENT PROFILE (src_target_c — the
+            // filament zone, from the Bambu report or Moonraker's material). There is
+            // no bed-threshold heating any more: with no print, or a filament that has
+            // no zone set (src_target_c == 0), the chamber stays idle in AUTO. Heat
+            // engages only while the source is connected and reporting a zone target,
+            // and always to that target. Safety cutoffs are evaluated elsewhere and
+            // are unaffected; this only ever narrows when AUTO heats.
+            bool was_engaged = s.auto_engaged;
+            // U1 Breath local trigger: the probe under the printer's bed. It is a
+            // physical sensor on the machine, so it is honoured even with the
+            // Klipper helper installed; Klipper's own M141/M191 still wins by
+            // moving the device to POWER_ON (and returns here on its M141 S0).
+            s.probe_heat = s.params.probe_auto_enable
+                ? pb_probe_decide(probe_ok, probe_c, s.params.probe_on_c,
+                                  s.params.probe_off_c, s.probe_heat)
+                : false;
+            // When the Klipper [dragonbreath] helper is installed it is the active
+            // manual controller; AUTO must not also drive the heater (two pieces of
+            // software cannot own the target). AUTO stays armed but never engages
+            // while the helper is present — the helper's commands drive POWER_ON
+            // instead. Remove the helper and AUTO resumes on the next tick.
+            bool zone_engaged = (!s.klipper_helper_present
+                                 && s.mk_connected && s.src_target_c > 0.0f);
+            s.auto_engaged = zone_engaged || s.probe_heat;
+            if (s.auto_engaged != was_engaged)
+                revision_advance_locked(s.source);
+            if (s.auto_engaged) {
+                // A printer-reported filament zone is more specific than the local
+                // AUTO card target, so it wins when both are available.
+                target = zone_engaged ? s.src_target_c : s.requested_target_c;
+                autonomous = true;
+            }
+            break;
+        }
+
+        case PB_MODE_DRYING:
+            if (now >= s.drying_deadline_us) {
+                set_off_locked(DB_SOURCE_WATCHDOG);
+            } else {
+                target = s.requested_target_c;
+                autonomous = true;
+            }
+            break;
+
+        case PB_MODE_OFF:
+        default:
+            break;
+    }
+    if (s.mode != PB_MODE_AUTO) s.probe_heat = false;   // the latch lives in AUTO only
+
+    if (watchdog_trip) {
+        // Sole control-task path for a latching remote/local timeout.
+        lease_invalidate_locked();
+        s.mode = PB_MODE_OFF;
+        s.requested_target_c = 0.0f;
+        s.auto_engaged = false;
+        s.drying_deadline_us = 0;
+        s.local_power_deadline_us = 0;
+        s.resume_mode = PB_MODE_OFF;   // #72: lease/local timeout latches off, no revert
+        revision_advance_locked(DB_SOURCE_WATCHDOG);
+    }
+
+    // Keep the computed transition and its actuator application under the same
+    // policy mutex. Otherwise an OFF command could land after this tick computed
+    // an old positive target but before it applied that target, allowing the
+    // stale tick to re-arm heat after OFF returned.
+    if (watchdog_trip) {
+        pb_heater_emergency_off(watchdog_reason);
+    } else {
+        // Avoid logging/reapplying an unchanged target on every 500 ms tick.
+        if (fabsf(pb_heater_get_target_c() - target) >= 0.05f)
+            (void)pb_heater_set_target_c(target);
+        if (autonomous && target > 0.0f)
+            pb_heater_notify_link_alive();
+    }
+
+    // Printer-reported chamber temperature is an AUTO-follow input only.
+    // Manual and Drying are local device modes and must regulate from the
+    // DragonBreath chamber NTC even when Bambu telemetry is connected/fresh.
+    float control_chamber_c =
+        (s.mode == PB_MODE_AUTO &&
+         s.mk_connected && isfinite(s.chamber_src_c))
+            ? s.chamber_src_c
+            : NAN;
+
+    pb_heater_set_control_chamber_c(control_chamber_c);
+    pb_heater_tick();
+
+    bool heat = pb_heater_heat_mode();
+    bool faulted = pb_heater_is_faulted();
+    float chamber_c = pb_ntc_smoothed_c(PB_NTC_CHAMBER);
+    bool chamber_ok = pb_ntc_last_status(PB_NTC_CHAMBER) == PB_NTC_OK
+                      && isfinite(chamber_c);
+    float ptc_c = pb_ntc_smoothed_c(PB_NTC_PTC);
+    bool ptc_ok = pb_ntc_last_status(PB_NTC_PTC) == PB_NTC_OK && isfinite(ptc_c);
+
+    bool cooldown = pb_purge_decide(heat, &s.heated_this_session,
+                                    chamber_ok, chamber_c, ptc_ok, ptc_c,
+                                    s.last_cooldown, pb_heater_get_cool_release_c());
+    s.last_cooldown = cooldown;
+
+    if (faulted && !s.last_faulted) {
+        s.mode = PB_MODE_OFF;
+        s.requested_target_c = 0.0f;
+        s.auto_engaged = false;
+        s.drying_deadline_us = 0;
+        s.local_power_deadline_us = 0;
+        s.resume_mode = PB_MODE_OFF;   // #72: fault sync latches off, no revert
+        lease_invalidate_locked();
+        // Preserve WATCHDOG attribution for a policy-triggered expiry.
+        if (!watchdog_trip) revision_advance_locked(DB_SOURCE_SAFETY);
+    }
+    s.last_faulted = faulted;
+
+    // Fan-only filtration band (stock parity): the blower runs whenever it is
+    // enabled + Moonraker is connected + the commanded bed SETPOINT has reached
+    // filter_temp_c — INDEPENDENT of DragonBreath's mode, so filtration works on
+    // prints that never reach the AUTO heat-engage threshold, and even while the
+    // device is idle. Heat engage stays AUTO-only (above). Setpoint trigger +
+    // hysteresis; fails to no-airflow when disabled or the Moonraker link drops.
+    {
+        bool was_filtering = s.auto_filtering;
+        // Trigger input: the printer's commanded bed setpoint while a source is
+        // connected, or (U1 Breath) the local probe's MEASURED bed temperature
+        // while it is enabled and readable — whichever is higher.
+        bool  filt_avail = s.mk_connected;
+        float filt_in    = s.mk_connected ? s.bed_target_c : 0.0f;
+        if (s.params.probe_auto_enable && probe_ok) {
+            filt_avail = true;
+            if (probe_c > filt_in) filt_in = probe_c;
+        }
+        if (!filt_avail || !s.params.filter_auto_enable) {
+            s.auto_filtering = false;
+        } else if (!s.auto_filtering && filt_in >= s.params.filter_temp_c) {
+            s.auto_filtering = true;
+        } else if (s.auto_filtering
+                   && filt_in < s.params.filter_temp_c - PB_AUTO_BED_HYSTERESIS_C) {
+            s.auto_filtering = false;
+        }
+        if (s.auto_filtering != was_filtering)
+            revision_advance_locked(s.source);
+    }
+
+    // The manual filtration fan (requested_fan_percent) is independent and additive
+    // — whichever wants more air wins, since want_airflow only raises a low request
+    // up to the 30% floor.
+    bool auto_filter = s.auto_filtering;
+    bool want_airflow = heat || faulted || cooldown || auto_filter;
+    uint8_t fan = s.requested_fan_percent;
+    if (want_airflow && fan < 30) fan = 30;
+    pb_fan_set_level(fan);
+
+    // Front-panel indication. Power is the "device alive / something's wrong"
+    // light; On/Auto/Dry each carry their own mode, so the panel alone tells you
+    // which mode is active. `faulted` is pb_heater_is_faulted(), which already
+    // covers a permanent inhibit as well as a latched trip. A fault forces
+    // mode=OFF above, so the mode LEDs go dark on their own.
+    // Power is release-only: GPIO21 is also the console TX pin (CONFIG_PB_POWER_LED).
+    pb_leds_set(PB_LED_POWER, faulted ? PB_LED_BLINK : PB_LED_SOLID);
+    pb_leds_set(PB_LED_ON, s.mode == PB_MODE_POWER_ON ? PB_LED_SOLID : PB_LED_OFF);
+    // AUTO distinguishes armed-but-waiting (no Moonraker link, or bed below the
+    // threshold) from actually driving heat — the most useful thing the panel says.
+    pb_leds_set(PB_LED_AUTO,
+                s.mode != PB_MODE_AUTO  ? PB_LED_OFF
+                : s.auto_engaged        ? PB_LED_SOLID
+                                        : PB_LED_BLINK_SLOW);
+    pb_leds_set(PB_LED_DRY, s.mode == PB_MODE_DRYING ? PB_LED_SOLID : PB_LED_OFF);
+
+    if (local_limit_expired)
+        ESP_LOGW(TAG, "local POWER_ON limit expired; mode set OFF");
+    xSemaphoreGive(s_lock);
+}
+
+void pb_policy_get_snapshot(pb_policy_snapshot_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!s_lock) return;
+
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    out->state_revision = s.revision;
+    out->mode = s.mode;
+    out->source = s.source;
+    out->requested_target_c = s.requested_target_c;
+    out->requested_fan_percent = s.requested_fan_percent;
+    out->moonraker_connected = s.mk_connected;
+    out->bed_c = s.bed_c;
+    out->bed_target_c = s.bed_target_c;
+    out->auto_engaged = s.auto_engaged;
+    out->auto_filtering = s.auto_filtering;   // standing band — independent of mode
+    // The Klipper [dragonbreath] helper is installed (mode-independent), so the UI
+    // can warn that AUTO is unavailable before it's even armed; auto_blocked_by_helper
+    // is the narrower "armed right now but held off" case.
+    out->klipper_helper_present = s.klipper_helper_present;
+    out->auto_blocked_by_helper = (s.mode == PB_MODE_AUTO && s.klipper_helper_present);
+    out->auto_bed_threshold_c = s.auto_bed_threshold_c;
+    out->params = s.params;
+    out->probe_heat = s.probe_heat;
+    out->drying = s.mode == PB_MODE_DRYING;
+    if (out->drying && s.drying_deadline_us > now) {
+        out->drying_remaining_s =
+            (uint32_t)((s.drying_deadline_us - now + 999999) / 1000000);
+    }
+    out->lease_active = s.lease_active && now < s.lease_deadline_us;
+    if (out->lease_active) {
+        copy_text(out->lease_id, sizeof out->lease_id, s.lease.id);
+        copy_text(out->lease_owner, sizeof out->lease_owner, s.lease_owner);
+        out->lease_expires_ms =
+            (uint32_t)((s.lease_deadline_us - now + 999) / 1000);
+    }
+    xSemaphoreGive(s_lock);
+
+    out->effective_target_c = pb_heater_get_target_c();
+    out->heater_demand = pb_heater_heat_mode();
+    out->heater_output = pb_heater_is_on();
+    out->effective_fan_percent = pb_fan_get_level();
+    out->fault_latched = pb_heater_is_faulted();
+    out->inhibited = pb_heater_is_inhibited();
+    const char *reason = pb_heater_fault_reason();
+    copy_text(out->fault_reason, sizeof out->fault_reason, reason);
+
+    out->chamber_status = pb_ntc_last_status(PB_NTC_CHAMBER);
+    out->ptc_status = pb_ntc_last_status(PB_NTC_PTC);
+    out->chamber_c = out->chamber_status == PB_NTC_OK
+        ? pb_ntc_smoothed_c(PB_NTC_CHAMBER) : NAN;
+    out->ptc_c = out->ptc_status == PB_NTC_OK
+        ? pb_ntc_smoothed_c(PB_NTC_PTC) : NAN;
+    out->bed_probe_status = pb_ntc_last_status(PB_NTC_BED);
+    out->bed_probe_c = out->bed_probe_status == PB_NTC_OK
+        ? pb_ntc_smoothed_c(PB_NTC_BED) : NAN;
+
+    // Report the ACTUAL residual-heat purge state, not an inference from fan
+    // levels. The old "effective fan > requested fan" heuristic also matched the
+    // AUTO fan-only filtration band (effective 100, requested 0), which made the
+    // API report thermal_purge and the UI show "Cooling down" during filtration.
+    out->thermal_purge = s.last_cooldown;
+}
+
+pb_mode_t pb_policy_get_mode(void)
+{
+    if (!s_lock) return PB_MODE_OFF;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pb_mode_t mode = s.mode;
+    xSemaphoreGive(s_lock);
+    return mode;
+}
+
+const char *pb_policy_mode_str(pb_mode_t mode)
+{
+    switch (mode) {
+        case PB_MODE_POWER_ON: return "power_on";
+        case PB_MODE_AUTO:     return "auto";
+        case PB_MODE_DRYING:   return "drying";
+        case PB_MODE_OFF:
+        default:               return "off";
+    }
+}
+
+const char *pb_policy_source_str(db_source_t source)
+{
+    switch (source) {
+        case DB_SOURCE_WEB:     return "web";
+        case DB_SOURCE_KLIPPER: return "klipper";
+        case DB_SOURCE_BUTTON:  return "button";
+        case DB_SOURCE_SAFETY:  return "safety";
+        case DB_SOURCE_WATCHDOG:return "watchdog";
+        case DB_SOURCE_BOOT:
+        default:                return "boot";
+    }
+}
+
+const char *pb_policy_result_str(pb_policy_result_t result)
+{
+    switch (result) {
+        case PB_POLICY_OK:                return "ok";
+        case PB_POLICY_INVALID:           return "invalid";
+        case PB_POLICY_REVISION_CONFLICT: return "revision_conflict";
+        case PB_POLICY_FAULT_LATCHED:     return "fault_latched";
+        case PB_POLICY_INHIBITED:         return "inhibited";
+        case PB_POLICY_STALE_LEASE:       return "stale_lease";
+        case PB_POLICY_PERSIST_FAILED:    return "persist_failed";
+        case PB_POLICY_BUSY:              return "heater_busy";
+        default:                          return "unknown";
+    }
+}

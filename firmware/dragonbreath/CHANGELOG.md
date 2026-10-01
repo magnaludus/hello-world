@@ -1,0 +1,1177 @@
+# Changelog
+
+All notable changes to the **DragonBreath** firmware are documented here.
+Format follows [Keep a Changelog](https://keepachangelog.com/); versions are the
+firmware release tags (`vX.Y.Z`). The release workflow pulls the matching section
+below into the GitHub Release notes.
+
+## [Unreleased]
+
+## [1.1.19] - 2026-09-23
+
+### Added
+- **Selectable chamber-control method — Bang-Bang (default) vs PID/PTC
+  (experimental).** The v1.1.16 PID approach cap held SSR duty to 40 % within
+  2 °C of target, but the hardware needs ~60 % to hold, so it stalled ~2 °C low
+  (#95). Bang-Bang (the v1.1.15 on/off hysteresis) is now the default and holds
+  setpoint; PID/PTC stays selectable for A/B testing. Both keep every safety
+  layer (over-temp/sensor/comms trips, local + element foldback). Select it on
+  the **Settings** card (dragon-core v0.35.2 dc_ui) or via
+  `GET`/`POST /api/v2/heater_method`; `heater.method` is reported in
+  `/api/v2/state`. NVS-persisted, default Bang-Bang. Live-validated on hardware:
+  Bang-Bang held a 55 °C target at 54.7 °C mean / 92 % within ±1 °C over a 3.4 h
+  print, element peak 94.6 °C (10 °C under the 105 °C trip). Fixes #95.
+- Configurable device hostname (web portal **Device** section), used for DHCP
+  and mDNS (`<hostname>.local`). Defaults to `dragonbreath`, letting multiple
+  devices coexist on the same network without a hostname conflict. Takes effect
+  after a restart. The hostname (and its RFC 1123 validation) is owned by
+  **dragon-core v0.35.0** (`dc_wifi`), so it is family-wide rather than
+  DragonBreath-specific.
+
+### Fixed
+- **Chamber can't hold setpoint (regression since v1.1.16).** The chamber
+  controller stalled ~2 °C below target ("gets to 64, can't reach 65"). The
+  approach cap limited SSR duty by *distance to target* (40% within 2 °C), which
+  clamped the steady-state hold — a stable attractor at `target − 2 °C` for any
+  enclosure whose hold duty exceeds the cap — and also throttled the element below
+  its safe capability, adding SSR switching wear. Replaced with a rate-gated soft
+  anti-overshoot that only damps a genuinely fast approach and never clamps a
+  settled hold; the element (PTC) foldback remains the real near-target limiter.
+  Bench-validated on an enclosed U1: chamber hold 62.9 °C → 64.3 °C (recovering
+  v1.1.15), matching the last-known-good firmware.
+- **AUTO picked the wrong material on multi-filament projects.** AUTO indexed the
+  slicer's per-slot `filament_type` list by the active tool, which on the
+  single-nozzle U1 is always slot 0 — so a project sliced from a later slot (e.g.
+  a PETG object in a PLA+PETG project) followed slot 0 and chose the wrong (or no)
+  chamber target. Now cross-references `filament_used_mm` to follow the filament
+  actually printed. Via **dragon-core v0.35.1** (`dc_moonraker`, #65);
+  live-validated on hardware.
+
+### Changed
+- Cut steady-state SSR switching (~12/min → ~4/min) by widening the
+  time-proportioning window 10 s → 30 s and adding a 2 s minimum on/off dwell —
+  addressing solid-state-relay wear from the v1.1.16 duty modulation.
+- The gate that arms approach damping uses an EMA-filtered rise rate, so ~0.1 °C
+  NTC quantization steps no longer flicker the cap through the hold.
+
+> The fixed safety cutoffs (105 °C element / 85 °C chamber / 70 °C target) are
+> unchanged. On a lossy enclosure, raising the existing **Foldback cut** advanced
+> setting (default 102 °C) toward 103 °C gives the element more headroom to reach a
+> full setpoint.
+
+## [1.1.18] - 2026-09-11
+
+### Changed
+- Hide the filament-zone settings (**Filament Zones** and **Custom Profiles**)
+  while the Klipper `[dragonbreath]` helper is active. Like AUTO, those settings
+  only feed the device's own AUTO mode, so they are inert when the helper owns
+  chamber heat — the dashboard now hides them alongside AUTO. Via **dragon-core
+  v0.34.2** (dc_ui).
+
+## [1.1.17] - 2026-09-11
+
+### Changed
+- AUTO now defers to the Klipper `[dragonbreath]` helper. When the helper is
+  installed it owns chamber heat directly (`M141`/`M191`), so AUTO stays armed but
+  does not drive the heater (surfaced as `environment.auto_blocked_by_helper`) and
+  resumes automatically once the helper is removed — no more silent tug-of-war
+  between the two controllers. Requires **dragon-core v0.34.1**.
+
+### Documentation
+- Added a task-focused chamber-heater guide explaining that a new heater requires
+  printer/slicer workflow integration rather than "just working." It makes AUTO
+  and slicer/Klipper control explicitly alternative workflows, documents several
+  valid heating orders, warns about OrcaSlicer's leading blocking `M191`, and
+  covers printer-specific auxiliary-fan, bed-position, toolhead-position, homing,
+  and thermal-expansion considerations. A recommended CoreXY starting pattern
+  starts bed/chamber together, parks the toolhead, raises the bed, circulates at
+  roughly 70%, then waits and soaks. It also explains why detecting an active
+  `[dragonbreath]` controller hides AUTO; the Snapmaker U1/PAXX profile remains
+  only a worked example.
+- Updated stale feature, control-source, API, and OEM-parity descriptions for the
+  current filament-follow AUTO behavior and the PrusaLink bed-follow exception.
+
+## [1.1.16] - 2026-09-09
+
+### Added
+- Port chamber heat control to a real PID (**dc_pid**) with a hardware-validated
+  response, replacing the previous bang-bang control; includes approach-cap
+  saturation handling and PID-demand normalization across approach caps.
+- Expose product-owned heater control telemetry in API v2 state snapshots:
+  commanded SSR-window duty, the active PID approach limit, and the dominant
+  controller or thermal constraint. This is read-only observability and does
+  not change heater control or safety behavior.
+- Broadcast heater capability over ESP-NOW as a `dc_peer` provider (#94), so peers
+  such as DragonVent can see the chamber heater on the local ESP-NOW fabric.
+
+### Fixed
+- Reject duplicate zero-cross edges in the fan zero-cross detection path.
+
+### Documentation
+- RFCs proposing the Dragon device integration planes and grounding the ESP-NOW
+  fabric in the existing prototype.
+
+## [1.1.15] - 2026-09-01
+
+### Fixed
+- Restore the standard-radio Wi-Fi path for DragonBreath. The firmware no longer
+  forces `WIFI_PS_NONE`, and **dragon-core v0.32.0** defaults normal-antenna
+  products to modem power-save, the original retry/boot budgets, and no aggressive
+  DHCP watchdog. The constrained-radio tuning remains available only to products
+  that explicitly opt in.
+
+### Added
+- Add a native-USB ESP32-C3 debug profile that keeps production networking and
+  the web UI active while compiling out every Panda-specific GPIO/ADC backend.
+  Unlike HIL images, it exposes no JSON command console.
+
+## [1.1.14] - 2026-08-26
+
+### Changed
+- Pin **dragon-core v0.30.0** — **Wi-Fi join reliability.** Disables WiFi modem
+  power-save (fixes "associated but never gets a DHCP IP"), adds a no-DHCP-IP
+  watchdog that drops a mesh node that admits the client but won't hand out a
+  lease and tries another, raises the connect-retry budget, and adds an opt-in
+  **fallback** AP availability mode (STA-only while connected, recovery portal
+  only if the join fails). Hardware-proven on a C3 in a multi-AP mesh.
+
+## [1.1.13] - 2026-08-26
+
+### Added
+- **Bambu printer-chamber diagnostics.** `GET /api/v2/state` now exposes
+  `environment.printer_chamber_temperature_c` and `printer_chamber_age_ms`.
+  Stale or unavailable Bambu chamber samples are reported as `null`.
+
+### Changed
+- **Bambu chamber regulation now follows the printer's chamber sensor** while keeping
+  DragonBreath's local chamber NTC and PTC safety-authoritative. External-sensor
+  regulation is bounded by a local chamber thermal limiter: heat cuts at **72 °C**
+  local and may resume below **67 °C**, while the independent hard chamber
+  over-temperature latch remains unchanged. Direct printer-chamber regulation applies
+  only in **Auto**; **Manual** and **Drying** always regulate from DragonBreath's local
+  chamber NTC.
+- **External-regulation operating range:** hardware validation was performed at a
+  **60 °C** chamber target. Because the local soft limiter cuts at 72 °C, targets near
+  the configurable 65–70 °C ceiling may be limited before the printer's bulk chamber
+  sensor reaches setpoint, depending on heater/outlet temperature rise.
+- **Bambu model compatibility:** direct chamber regulation currently depends on the
+  legacy `chamber_temper` telemetry field. Bambu models that report chamber temperature
+  only through newer `device.ctc.info.temp` telemetry will safely fall back to local
+  NTC regulation until that source is supported by `dc_bambu`.
+- **Privacy:** `environment.bambu_serial` is no longer exposed by API v2 state
+  responses. The configured printer serial remains internal and is still used for
+  Bambu MQTT topic selection.
+- Pin **dragon-core v0.29.0**.
+
+### Fixed
+- **Prusa status freshness.** The PrusaLink control source now expires stale
+  status snapshots and fails cold rather than acting on outdated data
+  (dragon-core #51).
+
+## [1.1.12] - 2026-08-24
+
+### Added
+- **Prusa (PrusaLink) chamber control.** DragonBreath can now follow a **Prusa Core One**
+  (or any PrusaLink printer) as a control source. Because PrusaLink reports no filament
+  type, this source **follows the bed**: in **Auto**, the chamber heats to your chamber
+  target once the printer's bed setpoint reaches your bed threshold — both set on the
+  dashboard's **Auto** card, which now shows bed-follow controls when a bed-only printer
+  is selected (filament-aware printers still follow the filament profile). Configure it
+  under **Setup → Control source → Prusa (PrusaLink)** with the printer host and its
+  PrusaLink password. Read-only; if the printer stops responding the chamber safely
+  disengages — and an incomplete/partial status response is treated as loss-of-source
+  rather than heating on a stale bed target. Validated end-to-end by a Prusa user.
+  Bumps **dragon-core** to **v0.28.1**.
+
+### Fixed
+- **Bambu chamber temperature no longer goes stale silently** — a chamber reading that
+  stops updating over MQTT is now expired rather than held indefinitely (dragon-core #47).
+
+## [1.1.11] - 2026-08-20
+
+### Added
+- **Wi-Fi AP availability modes.** The setup/recovery access point can now be set to
+  **Always on** (default), **On for 15 minutes after reboot**, or **Off** (API-only).
+  The AP runs concurrently with your normal Wi-Fi, so the setup portal stays reachable
+  even when the device is on your LAN. Bumps **dragon-core** to **v0.27.0**.
+- **On-device reset combo.** Hold **Power + Auto** together for 5 seconds to erase the
+  device configuration (Wi-Fi credentials, control token, saved policy, calibration)
+  and reboot — all panel LEDs flash 3× to confirm. A fail-safe way back in if you're
+  ever locked out (the reboot also cuts the heater).
+- **`flash.py --erase-nvs`.** The USB equivalent of the reset combo: clears only the
+  config (NVS) region, leaving the firmware intact.
+
+### Fixed
+- **The Wi-Fi setup page now opens automatically** when you connect to a fresh or
+  just-erased device's setup AP (it could previously land on the home page instead).
+
+## [1.1.10] - 2026-08-19
+
+### Fixed
+- **Moonraker connection can no longer silently die.** A half-open WebSocket used
+  to leave the device "connected" but frozen on stale idle data forever (it stopped
+  tracking the printer right after coming online). Added WebSocket ping/pong plus a
+  staleness watchdog that force-reconnects (and re-subscribes) if no update arrives
+  for ~45 s. Bumps **dragon-core** to **v0.24.0**. Hardware-validated across a
+  printer-host reboot.
+
+## [1.1.9] - 2026-08-18
+
+### Changed
+- **Quick-control presets save automatically.** The Settings → *Quick-control presets*
+  card no longer has a Save button — edits apply live on change (with a brief "Saved"
+  confirmation), matching the *Filament zones* card. Bumps **dragon-core** to **v0.22.0**.
+
+## [1.1.8] - 2026-08-14
+
+### Changed
+- **Control token moved to the device setup page.** The control-token field now
+  lives on the recovery-safe **device setup** page, next to Wi-Fi and the control
+  source, instead of the in-app Settings card — so all network/security settings sit
+  on one page. The redundant **Network & printer** block on the Settings page (whose
+  only action was a redirect to setup) has been removed.
+- Bumped **dragon-core** to **v0.20.0** (control-token relocation; also carries the
+  normalized Bambu print phases + print-progress exposure from v0.18–v0.19).
+
+## [1.1.7] - 2026-08-13
+
+### Added
+- **AUTO follows the filament profile.** In **AUTO**, the chamber now heats to the
+  active print's *filament zone* — for **Klipper** (from Moonraker's active-tool
+  material) as well as Bambu — instead of arming a fixed target on a bed threshold.
+  Set per-filament targets in **Filament Zones** (now on the Settings page). With no
+  print, or a filament that has no zone set, AUTO holds the chamber idle.
+- **Customizable quick-control presets.** The four one-tap dashboard temperatures
+  are now editable and persisted (Settings → Quick-control presets).
+
+### Changed
+- Dashboard/Settings overhaul: one-row quick controls (Filter + presets), Filament
+  Zones/Custom Profiles moved to Settings, a more compact Status card, and a
+  responsive layout that scrolls small desktop windows without cramming.
+- Bumped **dragon-core** to **v0.17.0** (combined ABS/ASA + PA filament zones,
+  source-agnostic zone matching, dashboard/filament-follow UI).
+
+### Fixed
+- The web UI no longer stalls during a print: the LWIP socket pool is raised so
+  httpd keeps accepting connections under the printer client's load.
+
+## [1.1.6] - 2026-08-11
+
+### Added
+- **Bambu LAN discovery in setup.** When configuring a Bambu printer, a
+  **Search for printers on the network** button now finds Bambu printers over
+  SSDP and fills in the host + serial for you — you only enter the LAN access
+  code. Discovery is user-initiated only (it runs when you open/click Bambu
+  setup, never in the background) and holds no socket open between scans.
+
+### Changed
+- Bumped **dragon-core** to **v0.13.0** (brings the shared on-demand Bambu
+  discovery plus the intervening core work).
+
+## [1.1.5] - 2026-08-10
+
+### Added
+- **Restore AUTO after a one-off manual override (#72).** When the heater is in
+  **AUTO** and you do a one-off **manual** run, the device now returns to AUTO
+  "waiting" when that run ends — either a local timed run completing or the
+  on-device **On** button stopping it — instead of dropping to idle. An explicit
+  **OFF** (the `off` command or the front-panel **Power** button) still stays off,
+  and any safety-driven off (fault, comms/lease timeout, panic) latches off and
+  never reverts. Only AUTO is resumed (not drying); the memory is RAM-only and
+  never persists across a reboot.
+
+## [1.1.4] - 2026-08-10
+
+**Firmware-update UX restored on the shared setup surface, from `dragon-core` v0.7.0.**
+
+### Added
+- **On-board firmware update, rebuilt.** Uploading a `.bin` from `/setup` now shows a live
+  **progress %** (was a static message); on success it polls the rebooting device and
+  returns to the dashboard. A dropped connection after upload reports "device rebooting,
+  verifying…" (the dashboard version is the real confirmation), and a configured control
+  token is re-prompted and retried.
+- **Update check.** DragonBreath advertises its release repo via `GET /api/v2/info`, so the
+  UI can check GitHub for a newer stable release and show the version + expected SHA-256 +
+  download link (notify-then-manual-upload; never auto-flashes). Runs one request per load
+  on installed builds only — local/dev (`-dirty`/`-g<hash>`) builds skip it.
+- **Setup password reveal.** Show/Hide toggle on every setup password field (Wi-Fi,
+  fallback AP, product secrets) to catch a mistyped Wi-Fi password.
+
+### Changed
+- **`/fw` and the Settings "Firmware update" button** open setup and scroll to the
+  firmware/maintenance card (was buried at the bottom); the button is now the prominent
+  primary action.
+- **Re-pinned `dragon-core` v0.6.1 → v0.7.0.**
+
+## [1.1.3] - 2026-08-10
+
+**Shared-UI polish for the /setup and /console pages, from `dragon-core` v0.6.1.**
+
+### Changed
+- **`/setup` shows only the selected control source.** Instead of listing every source
+  (Klipper/Moonraker, Bambu, HA, Klipper-MQTT) at once, the setup surface now reveals
+  only the section for the configured `ctl_src` — changing the selector reveals the
+  chosen source live. **Home Assistant stays always-visible**, since it carries over as
+  read-only telemetry alongside any control source. (Product sections tagged with
+  `visible_when`; `dc_ui` honors it — dragon-core #13.)
+- **Re-pinned `dragon-core` v0.6.0 → v0.6.1.**
+
+### Fixed
+- **`/console` no longer prompts for a control token on presence-only devices.** The
+  page now sends a non-empty auth header by default, so a device with no control token
+  configured loads the log without a spurious prompt; only a real 403 prompts. (Core
+  `dc_portal`, dragon-core #13.)
+
+## [1.1.2] - 2026-08-10
+
+**Restores the `/diag` and `/console` pages dropped in 1.1.1, now split by where they
+belong.** Diagnostics are device-specific, so `/diag` is product-local; the firmware
+console is generic, so it moves to shared core.
+
+### Fixed
+- **Restored the device-specific `/diag` page** (regressed in 1.1.1). The portal
+  extraction dropped it; it's re-registered by the `db_portal` adapter — a browser-side
+  chamber/element(PTC)/SSR/fault logger with a live trend and CSV export over the
+  read-only SSE stream (`/api/v2/events`), no USB needed.
+- **Restored `/console` via shared core.** The generic firmware-log page now comes from
+  `dragon-core` `dc_portal` (`GET /console` + `GET /api/v1/system/console`), picked up
+  by the re-pin below, instead of a product-local copy.
+
+### Changed
+- **Re-pinned `dragon-core` v0.5.4 → v0.6.0.** Brings the core `/console` page, plus
+  `dc_ui` setup-note fixes: the Custom profiles card states profiles apply only in AUTO
+  during a Bambu print, and the advanced max-temp "experts only" note points to the
+  built-in `/diag` page instead of the USB `tools/diag.py`.
+
+## [1.1.1] - 2026-08-09
+
+**Provisioning, recovery, and the setup surface move into `dragon-core`; DragonBreath
+keeps a thin product adapter.** No changes to NVS keys, API v2 routes, or OTA/recovery
+behavior — an in-place OTA from 1.1.0.
+
+### Changed
+- **Provisioning and recovery moved to `dragon-core` (`dc_portal`).** The shared
+  component now owns the HTTP server, captive DNS, AP/STA setup SPA, Wi-Fi scan and
+  fallback-AP routes, logs, OTA upload, and factory-reset transport. DragonBreath's
+  local `db_portal` is only a product adapter: it registers API v2, describes the
+  printer/controller fields, preserves configured secrets on blank submissions,
+  enforces the existing heater-off maintenance guard, restricts OTA images to
+  DragonBreath or stock Panda Breath, and erases the unchanged `app_nvs` namespace.
+  `/setup`, `/fw`, `/console`, `/update`, and the API v2 routes remain compatible.
+- **Filament chamber zones are edited from the dashboard, not `/setup`.** The shared
+  setup surface describes the Bambu connection only (host, serial, access code); the
+  built-in and custom zone editors live in the dashboard's **Filament zones** and
+  **Custom profiles** cards, applying live through `GET/POST /api/v2/zones`. The
+  1.1.0 note that zones apply only in AUTO during an active Bambu print now travels
+  with those cards in `dc_ui`.
+- **Inactive source configuration remains intact in shared setup.** `dragon-core`
+  `v0.5.4` makes Bambu and Moonraker configuration readable and editable before
+  their clients start, so the shared portal preserves every saved field when a
+  different control source is active. Product-local HA and Klipper-MQTT adapters
+  provide the same cold-boot behavior.
+- **Shared setup UI reliability.** Provisioning reads now use the same control-token
+  authentication and retry flow as mutations, so Wi-Fi scan results and saved setup
+  fields load correctly. The setup surface is fully opaque, product-defined setup
+  cards carry the same spacing as the built-in ones, and maintenance identity is
+  populated before optional product/capability handling.
+- **Guarded ESP-IDF build entrypoint.** `tools/idf-build.sh` preflights the target
+  compiler and quarantines stale component-manager lock/cache state before build.
+
+## [1.1.0] - 2026-08-09
+
+**Dragon-family shared-core split, plus two new Klipper/HA integration paths.**
+DragonBreath is now a thin product layer over the shared
+[`dragon-core`](https://github.com/justinh-rahb/dragon-core) foundation (network,
+control-source selector, Bambu client, the dashboard SPA, and the MQTT client),
+keeping the board, sensors, heater, safety policy, and product UI local. Existing
+NVS keys, API routes, and OTA/recovery behavior are unchanged. The MQTT-Klipper and
+read-only-HA paths below are new in this release.
+
+### Added
+- **MQTT-only Klipper control source** (RFC #66) — for locked/managed Klipper
+  installs that can't add the `dragonbreath-klipper` extra. The device is commanded
+  by `printer.cfg` macros over the printer's own Moonraker MQTT: a **retained-aware
+  arming** contract (heat engages only on a fresh coherent `seq` **and** a live
+  heartbeat; 3×5 s missed heartbeats force heat off + latch `comms_lost`; never arms
+  from retained state), an `M141` shim (non-blocking `M191` alias), and a `/setup`
+  group. `GET /km-config` generates the exact `moonraker.conf` + `printer.cfg` +
+  Mosquitto ACL from your settings. Mutually exclusive with the other control
+  sources.
+- **Read-only Home Assistant telemetry alongside a control source.** HA can now run
+  as a passive **monitor** concurrently with Bambu/Klipper — it auto-starts when an
+  HA broker is configured but HA isn't the selected source, publishing MQTT-Discovery
+  sensors (chamber/element temp, target, mode) without subscribing commands or taking
+  a control lease.
+
+### Fixed
+- **Release hygiene:** `tools/package_release.sh` now refuses to package when
+  `main/dev_config.h` is present, preventing a developer's Wi-Fi/Moonraker credentials
+  from being compiled into a locally-built release image.
+
+### Docs
+- `/setup` now notes that filament heating zones apply only in AUTO mode (Bambu,
+  during an active print).
+
+### Changed
+- **Shared core extracted to `dragon-core`.** The board-neutral event log,
+  control-source selector, Bambu client, Wi-Fi/provisioning service, and Moonraker
+  client now come from the pinned `dragon-core` dependency under the product-neutral
+  `dc_*` namespace. Existing NVS namespaces and keys are preserved across the move.
+- **Dashboard UI extracted to `dragon-core` (`dc_ui`).** The STA-mode single-page
+  dashboard now comes from the pinned `dc_ui` component — a capability-aware, shared
+  Dragon-family SPA served as a reproducible embedded gzip — instead of a local
+  `pb_portal/www/app.html` gzipped at build time. The portal owns only the HTTP
+  response and routes; `/setup`, `/fw`, OTA/recovery, auth, and favicon stay
+  product-local. Adds an additive **`GET /api/v2/info` → `ui` descriptor**
+  (`schema` / `product` / `display_name`) so the shared SPA adapts per product;
+  older firmware without it is handled by the SPA's compatibility fallback.
+- **MQTT clients unified on a shared, hardened `dc_mqtt`.** The Bambu, Home
+  Assistant, and Klipper-MQTT clients now share one dragon-core MQTT client with
+  consistent locking and reconnect, replacing per-component esp-mqtt usage.
+
+## [1.0.4] - 2026-08-06
+
+**Bambu filament heating zones — the chamber target now follows the filament type of
+the active Bambu print (issue #64).**
+
+### Added
+- **Filament chamber zones (Bambu source only).** During a Bambu print, DragonBreath
+  reads the active tray's filament type from the LAN report and sets the chamber target
+  from a per-filament map — e.g. PETG → 40 °C — instead of the bed-threshold AUTO seam.
+  Preheats on `PREPARE`, holds through `PAUSE`, reverts to idle/AUTO when the print ends.
+  A zone target of `0` means "no zone / off"; an unrecognised filament also resolves to 0.
+  (Klipper is unaffected — it drives the chamber via `M141`/`M191` macros.)
+- **Six built-in filament types** with sensible defaults (PLA/TPU off; PETG 40; ABS/ASA
+  55; PC 60), each editable. Built-in targets can be set during initial config on `/setup`.
+- **User-defined custom profiles.** Add up to 8 custom filament profiles (PA, PCTG, …)
+  from the dashboard's **Custom profiles** card; add/update/remove applies live (no
+  reboot) and persists across reboots. Longest-prefix matching means a custom `PETG-CF`
+  wins over the built-in `PETG`.
+- **Dashboard:** a Bambu-only **Filament** row in the system-status card shows the active
+  print's filament; the **Filament zones** + **Custom profiles** cards appear when the
+  control source is Bambu. New API `GET/POST /api/v2/zones` (live edits, auth-gated POST).
+
+## [1.0.2] - 2026-07-31
+
+**Seamless config carry-over when installing over stock — WiFi, Moonraker, and Home
+Assistant now transfer automatically, with no captive-portal re-provisioning.**
+
+### Added
+- **Stock → DragonBreath NVS carry-over shim.** When DragonBreath is OTA-installed over
+  the stock Panda firmware, it reads stock's `app_nvs` blobs on first boot and populates
+  its own keys, so the device **rejoins the same WiFi and reconnects to Moonraker/HA
+  automatically:**
+  - `wifi_info` → `ssid` / `password` (rejoins WiFi — previously the OTA dropped to AP
+    setup, because stock stores WiFi as a blob under different keys than we read).
+  - `moonraker_info` → `mk_host` (`mk_port` defaults to Moonraker's `7125`, since stock's
+    port field is the printer's HTTP port).
+  - `ha_mqtt_info` → `ha_host` / `ha_user` / `ha_pass` / `ha_port` (Home Assistant MQTT).
+
+  Runs once and is non-destructive: it only fills in keys that are absent (never
+  overrides a user who provisioned via `/setup`), and the stock blobs are left intact.
+  Verified on hardware for all three (blob layouts RE'd with distinctive dummy values;
+  identical on stock 1.0.3/1.0.4). This is the linchpin for the no-USB Panda→DragonBreath
+  migration (`plans/panda-to-dragon-migration.md`).
+  Bambu (`bambu_mqtt_info`) is intentionally not carried yet — stock won't persist a
+  Bambu config without a live printer to bind, so there's no populated sample to RE from.
+
+## [1.0.1] - 2026-07-31
+
+Makes the automatic fan-only **filtration band** work without arming AUTO mode — it now
+runs as a standing behavior like stock, driven by the printer's bed setpoint,
+independent of DragonBreath's mode — and ships it **off by default (opt-in)**.
+Consolidates 1.0.1-rc1. Also a repo-wide **documentation correctness pass**.
+
+### Changed
+- **Filtration band is now a standing behavior (stock-shaped).** Previously the
+  automatic fan-only band only ran while AUTO mode was *armed*, so users who never
+  used AUTO (or ran manual/idle) never saw filtration even with the setting enabled.
+  It now runs whenever **Filtration-Auto is enabled + Moonraker is connected + the bed
+  setpoint reaches `filter_temp`**, in any mode. Heat engage is unchanged (still
+  AUTO-only, at the higher bed threshold).
+- **Filtration-Auto now ships OFF by default (opt-in).** A deliberate divergence from
+  stock (which filters by default): flashing this update will **not** start running a
+  user's fan unprompted. Enable it in **Settings → Filtration: Auto** for the
+  stock-style behavior. Users who had already enabled it keep their setting and get the
+  fix. Documented in [`docs/OEM_PARITY.md`](docs/OEM_PARITY.md).
+
+### Docs
+- Repo-wide correctness sweep: documented the selectable **control source**
+  (Klipper / Home Assistant / Bambu — all shipped since v0.8.0; earlier docs wrongly
+  called HA/Bambu "omitted") and the **`/diag`** + **`/console`** pages; documented
+  `GET /api/v2/console` and the `control_source`/`bambu_serial`/`bed_target_c` state
+  fields; fixed a non-existent macro reference in `SAFETY.md` and the `0.1 V`→`3.3 V`
+  constant in the `NTC_CONVERSION.md` reproduction configs.
+
+### Notes
+- `environment.auto_filtering` and `fan.reason = auto_filter` now report the band in
+  any mode (not just AUTO).
+- The AUTO/filter trigger remains the bed **setpoint** (commanded), not the measured
+  bed temp — stock parity.
+
+## [1.0.1-rc1] - 2026-07-30
+
+Fixes the automatic fan-only **filtration band** so it no longer requires arming AUTO
+mode — it now runs as a standing behavior like stock, driven by the printer's bed
+setpoint, independent of DragonBreath's mode.
+
+### Changed
+- **Filtration band is now a standing behavior (stock-shaped).** Previously the
+  automatic fan-only band only ran while AUTO mode was *armed*, so users who never
+  used AUTO (or ran manual/idle) never saw filtration even with the setting enabled.
+  It now runs whenever **Filtration-Auto is enabled + Moonraker is connected + the bed
+  setpoint reaches `filter_temp`**, in any mode — so filtration works on prints that
+  never reach the AUTO heat-engage threshold, and while idle. Heat engage is
+  unchanged (still AUTO-only, at the higher bed threshold).
+- **Filtration-Auto now ships OFF by default (opt-in).** A deliberate divergence from
+  stock (which filters by default): flashing an update will **not** start running a
+  user's fan unprompted. Enable it in **Settings → Filtration: Auto** to get the
+  stock-style behavior. Users who had already enabled it keep their setting and get
+  the fix. Documented in [`docs/OEM_PARITY.md`](docs/OEM_PARITY.md).
+
+### Notes
+- `environment.auto_filtering` and `fan.reason = auto_filter` now report the band in
+  any mode (not just AUTO). Docs updated (`api-v2.md`, `FEATURES.md`, `OEM_PARITY.md`).
+- The AUTO/filter trigger remains the bed **setpoint** (commanded), not the measured
+  bed temp — stock parity.
+
+## [1.0.0] - 2026-07-30
+
+The **no-USB** release. DragonBreath now installs *and* reverts entirely through the
+stock Panda firmware's own OTA updater — no opening the unit, no esptool. It runs as
+an app in the stock partition layout, so the stock bootloader, partition table, and
+web assets are never replaced. (Consolidates 1.0.0-rc1 … rc2.)
+
+### Install & revert (the model)
+- **Install (no USB):** on the stock Panda web UI → Firmware Update, upload
+  `dragonbreath-v1.0.0.bin`. Validated end-to-end on stock **1.0.3 and 1.0.4**.
+- **Revert to stock, two ways:** (1) Settings → Maintenance → **"Boot inactive slot"**
+  reboots into the stock app still sitting in the other OTA slot — one click, no upload
+  (available until DragonBreath's first self-update overwrites that slot); (2)
+  `/update` now accepts stock `panda_breath` images, so you can upload your stock
+  backup's app image any time to go back.
+
+### Added
+- **`POST /api/v2/boot-inactive`** + **`inactive_slot`** on `/api/v2/info` — the
+  identity-labeled "Boot inactive slot" action (revert to stock, or roll back a
+  DragonBreath version). Refused while heating; moves the boot pointer only, no flash
+  write; hidden when the slot is empty/unreadable.
+- **`/update` accepts stock `panda_breath` images** (any version) for revert-to-stock.
+
+### Changed
+- **Canonical partition layout is the stock Panda layout** (app slots 1920 K @
+  0x10000 / 0x1f0000, otadata @ 0xe000, nvs 20 K, spiffs, coredump; PHY embedded).
+  Byte-identical on stock 1.0.3 and 1.0.4.
+- **App-only releases:** the OTA image + `manifest.json` + `SHA256SUMS.txt` are
+  published; the factory image and USB install bundle are no longer attached (the
+  build machinery + `tools/flash.py` stay in the repo for recovery). USB is
+  recovery-only.
+- `tools/flash.py` offsets updated to the stock layout.
+
+### Fixed
+- `/fw` note now says you can return to stock (it accepts `panda_breath` images),
+  replacing the stale "does not restore stock / use USB" text.
+
+### ⚠ Upgrade note — alpha/beta testers
+**Back up stock first.** If your unit was USB-flashed (native layout), **restore your
+stock backup, then install 1.0.0 via the stock updater** — a stock-layout install
+can't be reached by OTA from a native-layout one. New installs are unaffected.
+
+## [1.0.0-rc2] - 2026-07-30
+
+### Changed
+- **Canonical partition layout is now the stock Panda layout.** `partitions.csv`
+  matches stock byte-for-byte (app slots 1920 K @ 0x10000 / 0x1f0000, otadata @
+  0xe000, nvs 20 K, plus spiffs + coredump; `phy_init` dropped — PHY is embedded in
+  the app). DragonBreath now installs and reverts as a plain **app through stock's
+  own OTA**, leaving the stock bootloader / partition table / spiffs in place — which
+  is what makes the WiFi revert-to-Panda (rc1) reliable. Layout confirmed **identical
+  on stock 1.0.3 AND 1.0.4.**
+- **Releases are app-only.** Only the OTA app image (`dragonbreath-vX.Y.Z.bin`) +
+  `manifest.json` + `SHA256SUMS.txt` are published. The full/factory image and USB
+  install bundle are **no longer attached to releases** — the build machinery and
+  `tools/flash.py` stay in the repo for recovery/dev. Install via the stock updater;
+  USB is recovery-only.
+- `tools/flash.py` USB offsets updated to the stock layout (otadata @ 0xe000, app
+  slot @ 0x10000).
+
+### Upgrade note (alpha/beta testers — do this before 1.0)
+- If your unit was **USB-flashed** (native layout), **restore your stock backup
+  first, then install 1.0 via the stock updater.** A stock-layout install can't be
+  reached by OTA from a native-layout one; reverting to a clean stock baseline first
+  removes the variability.
+
+## [1.0.0-rc1] - 2026-07-30
+
+### Added
+- **Revert to stock over WiFi: `/update` now accepts stock Panda Breath images.**
+  The OTA identity gate previously accepted only `project_name == "dragonbreath"`;
+  it now also accepts **`panda_breath`** (any version — 1.0.3 / 1.0.4 both carry that
+  project name). This lets a user flash their own stock backup's **app image** back
+  through DragonBreath's own web updater and return to stock — no USB, no opening the
+  unit. All other images are still rejected. Pairs with the no-USB *install* path
+  (stock's own updater → DragonBreath), which was validated end-to-end on hardware
+  with the v0.8.0 release image.
+  - Note: upload the stock **app** image (the OTA-type `.bin` / the app partition of
+    a backup), not a full 4 MB flash dump. Reverting to a *fully working* stock this
+    way assumes DragonBreath is running in the stock partition layout (i.e. it was
+    installed via stock's OTA), so stock's spiffs/partitions are intact.
+
+## [0.8.0] - 2026-07-30
+
+The pluggable-control-source + web-tools release. **Klipper (Moonraker) remains the
+default and is unchanged**; everything below is additive and the heater safety model
+is untouched and source-independent. Consolidates the 0.8.0-rc1…rc3 pre-releases.
+
+### Added
+- **Selectable control source — Klipper / Bambu / Home Assistant.** The device binds
+  to exactly one printer/controller, chosen in `/setup` (mutually exclusive).
+  - **Home Assistant (validated on hardware).** MQTT client with MQTT-Discovery — a
+    climate entity + chamber/element temperature sensors auto-appear in HA — plus a
+    retained state topic and command topics mapped to heater target/mode (holds a
+    device lease and heartbeats it). Declares Celsius so HA converts °C↔°F correctly
+    in both directions. Verified end-to-end (device + HA + Mosquitto).
+  - **Bambu LAN — EXPERIMENTAL, not yet validated against a printer.** Read-only
+    bed-follow over the printer's on-device LAN MQTT/TLS broker (`bblp` + LAN access
+    code, subscribe `device/<serial>/report`, `pushall` on connect, scan
+    `bed_temper`) feeding AUTO. Built from the OpenBambuAPI / ha-bambulab spec. Opt-in
+    and safe by construction (the source only produces a bed temperature into the
+    already-validated safety logic) — shipped for community validation. Select
+    "Bambu" in `/setup` to test; please report results.
+- **`/diag` diagnostics page.** Live SSE view of the `tools/diag.py` telemetry
+  (chamber/element temps, SSR output, mode, fault, running element-temp peak) with a
+  trend chart and a client-side CSV download. Read-only; **zero device RAM**.
+- **`/console` firmware log page.** Captures the raw `ESP_LOGx` stream into a 16 KB
+  RAM ring (boot log included; UART output preserved) served at the auth-gated
+  `GET /api/v2/console`; terminal-style view with auto-refresh + `.txt` download.
+  Motivated by newer no-USB Panda hardware (and release builds using the UART TX pin
+  as the Power LED), where the serial console is otherwise unreachable.
+
+### Changed
+- **AUTO / fan-only filtration trigger on the bed SETPOINT, not the measured temp**
+  (stock parity): heat/airflow engage as soon as the print *commands* bed ≥ threshold,
+  and disengage when the setpoint drops. Applies to Klipper and Bambu; exposed as
+  `environment.bed_target_c`.
+- **Dashboard status is control-source-aware** — shows "Home Assistant" or
+  "Bambu (&lt;serial&gt;)" instead of a misleading "Printer: not connected";
+  `control_source` + `bambu_serial` added to the state API.
+- **Periodic status heartbeat deduped** (whole-degree temperature compare) so
+  `/console` and the serial log stay readable — repeated states collapse to a
+  `repeated Nx` tally with a periodic liveness flush.
+- **`tools/flash.py` auto-falls-back the baud rate** (460800 → 230400 → 115200) for
+  flaky USB-serial links; `--baud` pins a single rate. All backup integrity checks
+  (size, ESP magic, on-chip hash verify) are unchanged.
+
+### Fixed
+- **`/setup` no longer wipes Wi-Fi on a config-only save.** The Wi-Fi dropdown
+  auto-selected a scanned network and submitted it with a blank password, dropping the
+  device to AP mode; it now defaults to "keep current Wi-Fi" in STA mode, so switching
+  control source (or editing any field) leaves credentials untouched.
+- **Password reveal** on `/setup` stays a plain eye (strikethrough = hidden) instead
+  of swapping to a monkey emoji.
+
+## [0.8.0-rc3] - 2026-07-28
+
+### Changed
+- **Dashboard status is control-source-aware.** In Home Assistant mode the
+  "Printer" row (which read a misleading "not connected", since HA has no printer
+  to follow) is relabeled **"Source: Home Assistant"**, and the **Controller** row
+  shows **"Home Assistant"** instead of the internal "Web UI (ha)". Bambu mode
+  labels the row **"Bambu (&lt;serial&gt;)"** (the LAN report carries no friendly
+  printer name, so the configured serial is used). Klipper mode is unchanged. The
+  active source is exposed as `environment.control_source`, and the Bambu serial as
+  `environment.bambu_serial`, in the state API.
+
+## [0.8.0-rc2] - 2026-07-28
+
+### Changed
+- **AUTO / fan-only filtration now trigger on the bed SETPOINT, not the measured
+  bed temperature (stock parity).** Heat (and the filtration band) engage as soon
+  as the print *commands* a bed at/above the threshold — so the chamber warms
+  alongside the bed instead of waiting for the bed to physically reach the
+  threshold — and disengage when the setpoint drops (e.g. print end). Applies to
+  both the Klipper (Moonraker) and Bambu sources; the bed setpoint is now plumbed
+  through the AUTO seam and exposed as `environment.bed_target_c` in the state API.
+
+### Fixed
+- **Changing configuration in `/setup` no longer wipes Wi-Fi.** Switching the
+  control source (or editing any field) could drop the device to AP mode: the
+  browser's Wi-Fi dropdown auto-selected a scanned network and submitted it with a
+  blank password, overwriting the saved credentials. The dropdown now defaults to
+  "keep current Wi-Fi" in STA mode, so a config-only save leaves Wi-Fi untouched.
+- **Password "show" toggle no longer swaps to a monkey emoji.** The reveal button
+  stays a plain eye and indicates state with a strikethrough (struck = hidden).
+
+## [0.8.0-rc1] - 2026-07-28
+
+### Added
+- **Selectable control source (Klipper / Bambu / Home Assistant).** The device now
+  binds to exactly one printer/controller, chosen in `/setup` under a new "Control
+  source" card. Klipper (Moonraker) remains the default and is unchanged. A new
+  `pb_source` selector persists the choice; `app_main` starts only the selected
+  client and feeds the existing AUTO seam (`pb_policy_set_env`) — the heater safety
+  model is unchanged and fully source-independent.
+- **Home Assistant integration (tested).** New `pb_ha` MQTT client connects to your
+  broker, publishes MQTT Discovery (a climate entity + chamber/element temperature
+  sensors auto-appear in HA), publishes retained state, and maps HA commands to
+  heater target/mode — holding a device lease and heartbeating it like any remote
+  controller. The climate entity declares Celsius (`temp_unit:C`) so HA converts
+  °C↔°F correctly in both display and setpoints. Validated end-to-end on real
+  hardware (device + Home Assistant + Mosquitto).
+- **Bambu LAN integration (experimental — untested against a printer).** New
+  `pb_bambu` MQTT-over-TLS client reads a Bambu printer's bed temperature over its
+  on-device LAN broker (`mqtts://<ip>:8883`, `bblp` + LAN access code, subscribe
+  `device/<serial>/report`, `pushall` on connect) so AUTO can follow a Bambu print.
+  Read-only — no control commands are ever sent to the printer. Built from the
+  OpenBambuAPI / ha-bambulab spec; **not yet validated on real hardware** — select
+  "Bambu" in `/setup` to test. See `plans/control-source-bambu-ha.md`.
+
+### Changed
+- **`/setup` no longer forces Wi-Fi re-entry to change configuration.** In STA mode,
+  saving with the Wi-Fi fields left blank keeps the existing credentials and just
+  applies the control-source/config change. Wi-Fi is still required during initial
+  AP provisioning.
+
+## [0.7.2] - 2026-07-28
+
+### Changed
+- **`/setup` and `/fw` now match the dashboard theme (light + dark).** The
+  captive-portal / provisioning / OTA pages were dark-only with their own palette;
+  they now share the dashboard's `light-dark()` tokens, follow the device theme,
+  and honor a pinned dashboard choice (same-origin `localStorage` `db_theme`). The
+  `/fw` update page is header-free (the product header stays on `/setup` and the AP
+  captive portal), its warnings ("Do not power off during the update") are bold +
+  red, the SHA-256 line wraps instead of overflowing the card, and text no longer
+  breaks mid-word.
+
+### Fixed
+- **Settings → Maintenance showed "--" for Firmware / Device ID / Boot ID.** The
+  v0.7.1 header rework removed the brand element, but the `/api/v2/info` handler
+  still set `$('brand').title`, throwing a null-reference that aborted the callback
+  before it populated the Maintenance fields. Removed the stale brand-tooltip write.
+- **Desktop no longer reflows or hides controls when the window/panel is narrow.**
+  The dashboard is embedded as an iframe in Mainsail/Fluidd, where container/width
+  queries measure the *panel*, not the desktop window — so a thin desktop panel
+  wrongly triggered the compact tile (which hid the Quick-controls) and, before
+  this, the phone stack. **All** responsive reflow — both the compact tile and the
+  vertical stack — is now gated on `pointer: coarse` (an actual touch device), so
+  desktop (mouse) keeps the full layout at any width and controls never disappear.
+  Mobile is unchanged.
+- **Version footer left-aligned** so it tracks the content's left edge instead of
+  centering across the full main width (which drifted away from the ~540 px control
+  card on wide screens).
+- **Status rows no longer truncate in a narrow card.** The Printer line
+  ("connected · bed 26 °C") was ellipsis-clipped; values now wrap, and in the
+  compact/touch view each row stacks (label above value) so the full line shows.
+
+## [0.7.1] - 2026-07-28
+
+### Changed
+- **Dashboard UI: reclaimed header space + mobile-friendly layout** (presentation
+  only — no firmware/behavior change). Removed the topbar (the "DragonBreath"
+  brand) and the per-page heading row that wasted vertical space; the mode name is
+  now folded into each card's intro line ("Manual heat: …", "Automatic mode: …",
+  "Dry cycle: …"), connection status moved to a dot at the top of the rail, and a
+  small **"DragonBreath &lt;version&gt;"** footer (live firmware version) replaces the
+  header brand. On narrow (phone) viewports the dashboard now **stacks vertically —
+  graph, then status, then controls — and scrolls**, instead of the cramped
+  two-column compact that also hid the controls; the wide/short Fluidd embed tile
+  keeps its container-query compact layout.
+
+## [0.7.0] - 2026-07-28
+
+### Added
+- **Phase E hardening — CI static-analysis gate + broader host/simulation fault
+  coverage.** No firmware runtime behavior change; this is tests, CI, and small
+  behavior-preserving refactors only.
+  - **cppcheck static analysis** runs on every PR over `components/` + `main/`,
+    failing the build on any error/warning/performance/portability finding. The one
+    unmodellable false positive (a GNU `asm()` label on an extern binary-blob symbol
+    in `pb_portal`) is suppressed inline with justification; the genuine finding it
+    surfaced — a `%u`/`int` format-type mismatch in the Moonraker WebSocket URI — was
+    fixed with a value-identical cast.
+  - **Warnings-as-errors for our own code.** `-Wall -Wextra -Werror` is applied
+    PRIVATE to every first-party `pb_*` component (never to ESP-IDF's own
+    components), enforced by the default, HIL, and release builds.
+  - **Two new host tests** wired into CI as required steps:
+    `pb_heater_safety_host_test` covers the heater safety-trip priority ladder
+    (PTC/chamber over-temp, fail-closed on a non-OK sensor while armed, comms-loss
+    watchdog); `pb_ntc_status_host_test` covers the NTC open/short/rail fail-status
+    mapping. The existing `pb_buttons` host test is now also run in CI.
+  - **Two safety decisions factored into pure, unit-tested inlines** (behavior
+    identical, single authoritative definition): `pb_heater_eval_trip()` — the exact
+    ladder `pb_heater_tick()` runs — and `pb_ntc_classify()` — the exact
+    open/short/rail classifier `pb_ntc_read()` runs.
+
+### Fixed
+- **HIL dev-board builds were silently broken.** Both dev-board HIL profiles
+  failed to link (`undefined reference to pb_ntc_rref_kohm`) because that getter
+  lived only in the real-ADC branch of `pb_ntc.c`, but CI still reported success —
+  the HIL build step chained `idf.py` commands without `set -e`, so a failed link
+  was masked by the subsequent compile-out check. The HIL NTC backend now provides
+  a `pb_ntc_rref_kohm()` (nominal 82 kΩ; the HIL profile has no Rref strap), and the
+  HIL build step runs with `set -e` so a build failure fails CI. Pre-existing since
+  the Rref-strap work; surfaced by the PR #42 review.
+
+## [0.6.5] - 2026-07-28
+
+### Added
+- **Fan-only chamber filtration (two ways).** The chamber blower can now run
+  fan-only — heater untouched — to filter/circulate chamber air:
+  - **Automatic in AUTO mode (stock-like).** When enabled (default **on**), AUTO
+    runs the blower alone once the printer bed reaches a configurable **filter
+    temperature** (default **30 °C**, range 20–60 °C), filtering before the heater
+    engages at the higher auto bed threshold. Hysteresis mirrors the engage band;
+    it fails to no-airflow if disabled or Moonraker drops. Set in **Settings →
+    Filtration (auto mode)** / `GET/POST /settings?filter_temp=&filter_auto=`.
+  - **Manual, out-of-band.** A new `filter` API v2 command runs the blower fan-only
+    **independent of mode** — not cleared by OFF, additive over any heat airflow,
+    and safe (no heat path). Surfaced as an **on-only Filtration button** on the
+    dashboard — like the temperature presets, a click activates it and it lights up
+    (turns blue) while active; **Stop** is the single control that turns it off.
+    **Enabling** it is idle-only: while the heater is heating or the cooldown purge
+    is running, turning filtration *on* is rejected (`heater_busy`, HTTP 409) and the
+    dashboard button dims, so a status-page toggle can't disturb an active heat cycle.
+    Turning it *off* is always allowed, and **Stop stops all** — the dashboard Stop
+    button clears filtration alongside the heater (and is clickable whenever
+    filtration is on), so filtration never lingers or "comes back" after a heat cycle.
+  - State adds `environment.auto_filtering` and `params.filter_temp_c` /
+    `params.filter_auto_enable`; the manual fan drives the existing (previously
+    unused) `requested_fan_percent` blower path. The heater and every over-temp
+    cutoff are unaffected.
+
+## [0.6.4] - 2026-07-27
+
+### Added
+- **Configurable element-foldback cut (advanced).** The soft over-temp foldback cut
+  temperature is now user-settable in **Settings → Foldback cut** (`GET/POST
+  /settings?fb_cut=`), bounded to **90–104 °C**. It defaults to **auto** — the board's
+  per-Rref value (99 °C on 33 kΩ / V1.0, 102 °C on 82 kΩ / V1.0.1) — and the slider shows
+  that default; setting it back to the default clears the override (0 = auto). Lower it if
+  the element runs hot/slow, raise it for more chamber temperature. This only shifts where
+  the **soft** foldback engages; the fixed **105 °C hardware cutoff is unaffected** and the
+  override can never exceed 104 °C, so it can't defeat over-temp protection.
+
+## [0.6.3] - 2026-07-27
+
+### Added
+- **Element-temperature foldback limiter (hysteresis).** Instead of driving the heater
+  full-power into the 105 °C PTC-element cutoff and hard-faulting, the SSR is now cut off
+  when the element reaches a per-board **cut** point and held off until it cools below the
+  **resume** point, so the element repeatedly cools back down instead of pinning against
+  the cutoff — the chamber keeps warming and a hot/marginal install no longer trips into
+  the "clear → trip again" loop. Thresholds are selected by the board's Rref strap:
+  **82 kΩ (V1.0.1) cut 102 / resume 99**; **33 kΩ (V1.0, runs the element hotter) cut 99
+  / resume 96** (a floating strap defaults to the conservative 33 kΩ pair). (An earlier proportional-duty ramp proved too gentle on a hot-running board: ~50 %
+  duty at 102–103 °C kept feeding the element so it ratcheted to ~104.8 °C; the hysteresis
+  forces a genuine cool-down cycle instead.) **Safety is unchanged:** the foldback can
+  only ever *remove* power, and the hard 105 °C cutoff remains the first, unconditional,
+  latching check — if the element still reaches it (welded SSR, runaway, sensor fault) it
+  latches off exactly as before. The pure hysteresis decision is covered by host tests.
+
+### Changed
+- **OTA update page shows upload progress and returns to the dashboard automatically.**
+  The firmware-update page (`/fw`) now streams the image via `XMLHttpRequest` and shows a
+  live **percent complete** while uploading/flashing (the device writes bytes as it
+  receives them, so the upload % tracks the flash), then — once the image is accepted —
+  **polls the rebooting device and redirects to the main screen** when it comes back on
+  the new firmware (with a ~2-minute fallback). A connection drop after the upload
+  finishes is treated as the expected reboot; a drop mid-upload is reported as a failure
+  so it can be retried.
+- **Dashboard temperature chart overlays chamber + PTC element with labeled axes.** The
+  trend now draws **both** the chamber and the PTC-element temperature on one shared,
+  auto-scaled graph with a **Y axis** (°C max/min) and an **X axis** (time span back from
+  "now"), plus a legend. All from the existing SSE telemetry; no API change.
+
+### Fixed
+- **Rref strap misread on a floating GPIO19 (both NTC readings ~15 °C off).** The
+  thermistor divider's reference resistor (82 kΩ vs 33 kΩ) is selected by a strap on
+  GPIO19, read once at boot — previously with both internal pulls disabled. On a board
+  that doesn't firmly drive the pin it **floats** and can latch the wrong value,
+  **differently on a cold power-on vs a warm OTA reboot** — silently choosing the wrong
+  Rref and shifting **both** the chamber and PTC readings by ~15 °C (observed on a V1.0
+  board: 27 °C after a USB flash, 12 °C after an OTA update; a couple of hard resets read
+  27 °C again). The strap is now sampled under an internal pull-up **and** an internal
+  pull-down: a firmly strapped pin reads identically both ways and is trusted, while a
+  floating pin disagrees and falls back to the **fail-safe 33 kΩ** default (a smaller
+  Rref biases readings *warm*, so the fixed 105 °C/85 °C over-temp cutoffs trip early
+  rather than late). The resolved value is exposed at `GET /api/v2/info` as `rref_kohm`
+  for diagnostics. Firmly-strapped boards are unaffected (V1.0.1 bench verified: firm →
+  82 kΩ, reading unchanged).
+
+## [0.6.2] - 2026-07-26
+
+### Added
+- **Configurable cooldown-fan "cool down to" temperature.** The residual-heat purge
+  (the fan that keeps running after a heat session until things cool off) previously
+  released at a fixed 40 °C. That temperature is now a persisted, user-settable
+  slider in **Settings → Cooldown fan** (range 30–65 °C, default 40 °C, also on
+  `GET/POST /settings?cool_release=`). Raise it for a hot ambient where the chamber
+  and heater element can't fall back to 40 °C — otherwise the purge fan would run
+  indefinitely. The engage point stays one 3 °C hysteresis band above the release
+  temperature. This is a comfort/wear setting, not a safety cutoff: the fixed
+  105 °C PTC / 85 °C chamber over-temp trips and their fault-driven airflow are
+  independent and unchanged.
+
+## [0.6.1] - 2026-07-24
+
+### Changed
+- **Vendored the OpenVent shared core locally (no more submodule).** The three
+  board-agnostic components that were built from the `external/OpenVent` git
+  submodule (`pv_evlog`, `pv_wifi`, `pv_moonraker`) are now first-party components
+  in `components/`, renamed `pb_evlog` / `pb_wifi` / `pb_moonraker` to match the
+  rest of the codebase. The submodule, `.gitmodules`, and `EXTRA_COMPONENT_DIRS`
+  are removed; CI no longer checks out submodules; the release manifest records
+  the vendored-core provenance instead. `git clone` no longer needs
+  `--recurse-submodules`. Derived from OpenVent (MIT) — see
+  [VENDORING.md](VENDORING.md). No firmware behavior change.
+
+## [0.6.0] - 2026-07-24
+
+### Added
+- **Persistent safety-fault latch (B2).** A hazard-driven safety trip (PTC/chamber
+  over-temp, sensor fault while heating, comms-loss watchdog) now survives a power
+  cycle: it is written to NVS on the latching transition and restored at boot, so a
+  device that tripped before losing power comes back up **heater-OFF with commands
+  inhibited** instead of silently ready to heat. NVS is loaded **before** the
+  control task starts, and a failed persist is **retried** (a pending flag keeps
+  trying until the commit lands) so an early or transiently-failed write can't lose
+  the latch across a reboot. The persisted cause is a stable numeric code (a live
+  reason string still carries session detail). Boot restore is **fail-safe** — if
+  the stored state cannot be read reliably the device comes up latched. Clearing a
+  fault is **persist-first**: if the NVS clear fails the latch is kept and the API
+  returns HTTP 500 (`persist_failed`) rather than falsely reporting it cleared.
+  User panic-off and the permanent inhibit are not persisted (documented
+  reboot-clears behavior); active mode/target/deadline/lease still never persist.
+
+### Changed
+- **Residual-heat purge hardened.** The post-heat cooldown fan now uses hysteresis
+  (engage at ≥ 40 °C, release only once **both** the chamber and PTC sensors are
+  below 37 °C) instead of a single chamber-only threshold, and it also runs when a
+  sensor reading is **unknown** right as heating ends (can't confirm cool → fail
+  safe). It remains strictly session-gated: the fan never starts on temperature
+  alone, and a power-cycle-while-hot does **not** spin it.
+
+## [0.5.2] - 2026-07-24
+
+### Fixed
+- **Live UI could silently stop updating (SSE slot leak).** The device caps
+  concurrent SSE event streams at 2, but a client that disconnected without a
+  clean close (tab killed, Wi-Fi blip, or a Moonraker-link flap churning the
+  network) held its slot for *minutes* — so after a couple of such drops every new
+  stream got `503` and the dashboard/Klipper live view froze even though the device
+  itself was fine and responsive. TCP keepalive is now enabled on the HTTP server
+  so a vanished peer is detected in ~25 s, and the SSE task additionally checks for
+  a peer FIN/RST every loop and frees the slot immediately (~0.3 s on the bench).
+  Normal (non-SSE) request latency was already healthy (~20 ms) and is unchanged.
+- **Dashboard shows fan and controller status again (regression from v0.5.0).**
+  The rewritten dashboard dropped the old at-a-glance detail, so you could no
+  longer tell what the fan was doing or who was in control. The System status card
+  now shows **Fan** (off, or on with the reason — heating / cooldown purge /
+  manual / safety airflow — and %), **Controller** (command source + lease owner),
+  **Auto** (engaged or waiting, with the bed threshold, when armed), **Drying**
+  (time remaining, when active), **Printer** (Moonraker link + bed temperature),
+  and **Fault**. All of it comes from the existing SSE `/api/v2/state` stream — no
+  API or firmware-behavior change.
+
+## [0.5.1] - 2026-07-24
+
+### Fixed
+- **Web UI no longer sprawls on large / 4K displays.** The SPA is built to fill
+  its Fluidd/Mainsail iframe, so opening it standalone on a big monitor stretched
+  every element edge-to-edge. It is now bounded to a centered panel (max
+  1200×820) on large viewports while still filling a small embed.
+- **Control-screen action button no longer floats over the last control.** On
+  Manual/Auto/Dry the primary action (e.g. "Start drying") used a sticky footer
+  that overlapped the final control (target/duration) when the screen was tight.
+  The action now sits in normal flow directly below the controls.
+- **Firmware-update (`/fw`), Wi-Fi setup (`/setup`), and the AP captive portal
+  match the new UI.** These pages still used the old stock-BIQU blue banner; they
+  now use the charcoal palette and dragon mark of the main app.
+
+## [0.5.0] - 2026-07-24
+
+A ground-up **responsive, touch-first Web UI** (issue #19), delivered as a
+self-contained gzip-embedded single-page app that reads cleanly from a phone up
+to a desktop and embeds in the Fluidd/Mainsail panel. The rewrite also lands the
+settings/maintenance/calibration surface that backs it, sensor calibration, and
+a round of safety hardening on the mutating endpoints.
+
+### Added
+- **Touch-first single-page UI (`pb_portal/www/app.html`).** One embedded,
+  gzip-compressed SPA replaces the old status page: a live **Dashboard**
+  (chamber/PTC temps, mode, trend, stop/clear) and dedicated **Manual**,
+  **Auto**, and **Dry** control screens with sticky primary actions, plus a
+  **Settings** screen. State streams over `GET /api/v2/events` (SSE) and the UI
+  pre-fills every control from the device's remembered `params`. (#19, #21)
+- **Settings, maintenance, and diagnostics endpoints.** New v2 API surface behind
+  the auth header: `GET/POST /api/v2/calibration`, `POST /api/v2/restart`,
+  `POST /api/v2/factory-reset`, `GET /api/v2/logs` (a heap snapshot of the event
+  ring), and `POST /api/v2/token` to set/clear the control token.
+- **Sensor calibration (bounded).** Per-sensor chamber/PTC offsets, clamped to
+  **±5 °C** on both set and NVS load and applied only to good readings, so a
+  stored or requested offset can never move a safety cutoff by more than the
+  documented bound. See [`docs/SAFETY.md`](docs/SAFETY.md).
+- **Configurable status LEDs.** LEDs can be enabled/disabled from Settings
+  (persisted), reported in `/settings`.
+- **Brand mark & favicon.** An angular dragon-head logo that inherits the theme
+  and stands alone in the compact header, plus a theme-adaptive favicon — an
+  inline SVG `<link>` and a real 32×32 PNG served at `/favicon.ico` (registered
+  before the SPA catch-all) so browser tabs show the mark.
+- **Light/dark and accessibility.** An Auto/Light/Dark toggle persisted to the
+  browser, `focus-visible` outlines on all controls, a `prefers-reduced-motion`
+  path, and an `aria-label`/`title` on the connection indicator so state is not
+  conveyed by colour alone.
+
+### Fixed
+- **Prompt control feedback across every command source.** Accepted front-panel,
+  Web UI, Klipper, and HIL mode commands now wake the full control task
+  immediately instead of waiting up to 500 ms for the periodic tick, so panel
+  LEDs and outputs track authoritative state promptly. Rejected button commands
+  now log the actual policy result, and remembered mode targets are clamped to
+  the runtime-configured heater maximum as soon as they load from NVS. (#20)
+- **Mutating endpoints fail closed and honestly.** `factory-reset` now captures
+  `nvs_open`/`nvs_erase_all`/`nvs_commit` results and returns HTTP 500 without
+  rebooting unless the erase and commit both succeed. Calibration and the LED
+  toggle now persist first and apply the in-RAM change only after a successful
+  commit, returning HTTP 500 `persist_failed` instead of reporting a save that
+  did not happen. Restart, factory-reset, **and** OTA (`/update`) now refuse
+  whenever the device is in any armed mode (`mode != OFF`), matching the
+  documented contract for armed Auto waiting below the bed threshold.
+
+### CI
+- The calibration clamp safety test (`run_ntc_calibration_host_test.sh`) is now a
+  required host-test step, and its load-path clamp is exercised with out-of-range
+  stored NVS values so the ±5 °C invariant is verified in CI.
+
+## [0.4.0] - 2026-07-24
+
+Phase C — the physical front panel comes alive. All four buttons and all four
+status LEDs are wired to the authoritative control state, so the device is fully
+operable and legible from the panel alone, with a long-press panic-off. Also
+lands the mode-parameter persistence that v0.3.0 documented but never shipped,
+plus the serial hardware-in-the-loop harness and an explicit OEM-parity matrix.
+
+### Added
+- **Front-panel buttons (`pb_buttons`).** All four buttons (Power, Auto, On, Dry)
+  are polled at 10 ms with 20 ms debounce and short/long-press detection. A short
+  press toggles that button's labeled mode, arming it from the remembered
+  parameters; a 2 s long-press latches a **panic-off**. A long-press on Power
+  while a fault is latched attempts a fault clear instead. Every button action is
+  attributed to the panel, invalidates any remote control lease, and appears in
+  both the dashboard and Klipper. A button held at power-on (or a shorted line)
+  is ignored until it releases — Power/Auto/Dry are ESP32-C3 strapping pins, so
+  **do not hold a front-panel button while the board boots**. The debounce /
+  long-press state machine is split into a dependency-free `pb_buttons_sm` unit
+  and host-tested directly.
+- **Long-press panic-off.** `pb_heater_request_panic_off()` latches the heater
+  off from any task without touching the SSR GPIO, and the policy drives the full
+  OFF transition (attributed to the button, lease invalidated) then wakes the
+  control task by notification so the SSR drops on the very next scheduling rather
+  than at the next periodic tick. It is **not** a safety-rated emergency stop —
+  see [`docs/SAFETY.md`](docs/SAFETY.md).
+- **Remembered mode parameters (persisted).** The last accepted manual target,
+  automatic target and bed threshold, and drying target and duration are now
+  stored in NVS and reported as `params` in `GET /api/v2/state`, so the UI
+  pre-fills from the device and a mode can be re-armed without re-entering
+  values. Closes a gap left by v0.3.0, which documented this persistence but
+  never implemented it. Writes are serialized through a single worker task and
+  record the clamped value the device actually applied. Parameters remain the
+  **only** policy state that survives a reboot — the active mode, target,
+  deadline, and lease still do not, so the device always boots OFF.
+- **Serial hardware-in-the-loop harness (`pb_hil` / `tools/hil.py`).** A
+  line-delimited JSON console for injecting chamber/PTC readings, sensor faults,
+  printer environment, and zero-cross events, and for reading back heater demand,
+  fan state, LEDs, mode, lease, and fault state. Ships with an isolated ESP32-C3
+  dev-board target whose mains GPIO is **compiled out**, so it is structurally
+  incapable of energizing Panda hardware, plus scripted scenarios, console
+  capture, and JSON pass/fail reports. A non-heating UART profile for the real
+  Panda is documented as the pre-release qualification gate. (#14)
+- **OEM parity matrix (`docs/OEM_PARITY.md`).** Tracks every user-visible stock
+  Panda Breath behavior as implemented, partial, planned, intentionally changed,
+  intentionally omitted, or unverified — so deliberate deviations are
+  distinguishable from gaps. (#12)
+
+### Changed
+- **Front-panel LEDs now show the active mode.** All four outputs are driven from
+  the authoritative policy snapshot instead of Power and On duplicating a single
+  "heating" signal: Power is solid whenever the device is up and blinks on fault,
+  while On, Auto, and Dry each light for their own mode. Auto slow-blinks when
+  armed but not engaged (no Moonraker link, or bed below the threshold), so the
+  panel distinguishes "waiting" from "heating". Power remains release-only —
+  GPIO21 is also the serial console TX.
+
+### Fixed
+- **Automatic and drying controls work from the dashboard.** v0.3.0 shipped both
+  modes in the state machine and API but the UI could not reliably drive them.
+  The cards now submit correctly, their input bounds match the policy's own
+  limits, and automatic status refreshes from live state rather than the value
+  last typed. (#13)
+- **`docs/HARDWARE.md` GPIO map corrected.** It still described buttons on GPIO7
+  and GPIO0 — those are the zero-cross detector and the chamber NTC. The table now
+  matches the bench-probed map already in `pb_board.h` (buttons on 9/8/10/2, Power
+  LED on 21) and documents the strapping-pin caveat.
+- **Wrap-safe control-loop scheduling.** The notify-aware control tick compared
+  FreeRTOS tick counts with an unsigned deadline test, which inverts across the
+  32-bit tick wrap (~497 days at 100 Hz) and would let the loop burst-tick for up
+  to one period. Now uses signed tick deltas, so the "absolute deadline, never
+  accelerates" invariant holds across a wrap.
+
+## [0.3.0] - 2026-07-23
+
+Iteration-2 core: an authoritative device-side control state machine, a
+versioned API, configurable safety settings, and real front-panel status LEDs.
+
+### Added
+- **Configurable safety settings (persisted).** Runtime-settable max-target
+  ceiling (default 70 °C, hard-capped at 70) and comms-watchdog timeout
+  (default 5 min, clamped to 10 s–5 min), stored in NVS and exposed via
+  `GET`/`POST /settings` and an Advanced/Safety card in the web UI. The fixed
+  105 °C PTC / 85 °C chamber cutoffs remain non-configurable. (#10)
+- **Real status LEDs.** The three mode LEDs (Auto/On/Dry) plus the **Power LED**
+  (GPIO21) are now driven to match the stock panel: Power/On solid while heating,
+  blink on a latched fault, off at idle. Because GPIO21 is the console-TX pin, the
+  Power LED is enabled only in release builds (`CONFIG_PB_POWER_LED`, set via
+  `sdkconfig.release`); dev builds keep the serial console. (#10)
+- **Authoritative control state machine (`pb_policy`).** A single device-side
+  owner of mode/target/lease state (Off / Power-On / Auto / Dry), with
+  lease-based remote ownership, revision-aware commands, and a boot-OFF /
+  no-auto-resume safety posture. (#9)
+- **API v2 (`/api/v2/*`).** Snapshot-authoritative `state`/`info`/`health`, an
+  SSE `events` stream (push instead of polling), and auth-gated `command` /
+  `heartbeat` with request-ID idempotency and exact-lease heartbeats. (#11)
+
+### Changed
+- **BREAKING (alpha API):** the alpha routes (`/status`, `/target`, `/heartbeat`,
+  `/reset`) are removed in favor of API v2. Requires the matching
+  **dragonbreath-klipper v2 helper** — flash firmware ≥ v0.3.0, then restart
+  klippy. Version mismatches fail safe (the chamber heater simply doesn't engage).
+
+## [0.2.0] - 2026-07-23
+
+### Added
+- **In-UI update notification** — on official (tagged) builds, the device `/fw`
+  page checks GitHub for a newer release and shows a download link + expected
+  SHA-256; you verify and flash it via the existing uploader (fully browser-side).
+- **Reproducible release pipeline** — pushing a `v*` tag builds in CI (pinned
+  ESP-IDF v5.3.5) and publishes a GitHub Release with a single-file
+  `-factory.bin` (first install, flash @ 0x0), the `.bin` application image (OTA),
+  a complete `-install-bundle.zip` (flasher + components + `FLASHING.txt`), a
+  `manifest.json` (source SHA, ESP-IDF version, submodule, per-artifact SHA-256),
+  and `SHA256SUMS.txt`.
+- **Post-print fan cooldown** — after a print, the blower keeps running until the
+  chamber cools below 40 °C, then stops. Gated on a heat-this-session flag, so it
+  never auto-starts on temperature alone (a reboot-while-hot leaves the fan off).
+
+### Changed
+- **Renamed OpenBreath → DragonBreath** across the firmware: build/project
+  identity and OTA image-identity gate, HTTP auth header `X-DragonBreath-Auth`,
+  Wi-Fi AP SSID `DragonBreath_XXXX` (with migration of the legacy default), mDNS
+  hostname `dragonbreath.local` (app-layer override; shared OpenVent core
+  untouched), web-UI title (🐉) and strings, logs, and docs. "Panda Breath"
+  remains only as the underlying-hardware descriptor.
+
+### Migration
+- The OTA image-identity gate now requires `project_name == dragonbreath`, so a
+  device on pre-rename firmware must be **USB-reflashed once** to cross over; OTA
+  works normally afterward.

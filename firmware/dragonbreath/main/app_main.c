@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: MIT
+// DragonBreath — open firmware for the BIGTREETECH Panda Breath (ESP32-C3).
+//
+// Safety-first init: the heater SSR is forced OFF before anything can request
+// heat, and the control/telemetry loop is started BEFORE networking so it runs
+// regardless of WiFi/Moonraker state (network bring-up must never gate the safety
+// loop). Networking uses dragon-core (dc_wifi + dc_moonraker):
+// connect to WiFi, dial into the printer's Moonraker over WebSocket, feed printer
+// state to pb_policy.
+//
+// BRING-UP PHASE: connect + read + log printer state, but DO NOT auto-heat yet
+// (chamber target held at 0) until the heat policy is defined.
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "pb_board.h"
+#include "pb_ntc.h"
+#include "pb_heater.h"
+#include "pb_fan.h"
+#include "pb_policy.h"
+#include "pb_leds.h"
+#include "pb_buttons.h"
+#include "pb_hil.h"
+#include "dc_evlog.h"
+
+#include "esp_mac.h"
+#include "dc_wifi.h"
+#include "dc_moonraker.h"
+#include "dc_source.h"
+#include "pb_peer.h"
+#include "dc_bambu.h"
+#include "dc_prusa.h"
+#include "pb_ha.h"
+#include "db_klipper_mqtt.h"
+#include <math.h>
+
+#include "pb_httpd.h"
+#include "db_portal.h"
+#include "esp_ota_ops.h"
+
+// Optional local dev config (gitignored): WiFi creds + Moonraker host. Without it
+// the build still works — the device just comes up without network credentials.
+#if defined(__has_include)
+#  if __has_include("dev_config.h")
+#    include "dev_config.h"
+#  endif
+#endif
+
+static const char *TAG = "dragonbreath";
+
+#define PB_TICK_PERIOD_MS 500
+#define DB_NVS_NAMESPACE "app_nvs"
+#define DB_NVS_KEY_BAMBU_CHAMBER_CTL "bb_ch_ctl"
+
+// Set true once the network components have been started, so the control loop
+// doesn't touch pb_* state before it's initialized.
+static volatile bool s_net_up = false;
+// Set true only if the selected source client's *_start() succeeded — never
+// query a client that failed to initialize (its internal state/mutex may be
+// unset). Exactly one of these is ever set, per the control-source selector.
+static volatile bool s_mk_up    = false;   // Klipper (Moonraker)
+static volatile bool s_bambu_up = false;   // Bambu LAN MQTT
+static volatile bool s_ha_up    = false;   // Home Assistant MQTT
+static volatile bool s_km_up    = false;   // Klipper (MQTT)
+static volatile bool s_prusa_up = false;   // PrusaLink HTTP
+// The persisted control source, read once at boot. Default Klipper.
+static dc_ctl_source_t s_src = DC_SRC_KLIPPER;
+// Opt-in only: when true, a fresh Bambu-reported chamber temperature may drive
+// set-point regulation. Local DragonBreath chamber/PTC sensors remain the
+// authoritative safety inputs regardless of this flag.
+static bool s_bambu_direct_chamber_control = false;
+
+// Control-task handle, so accepted policy commands can update outputs/LEDs
+// without waiting up to a full periodic tick. Panic-off uses the same prompt
+// path to drop the SSR.
+static TaskHandle_t s_control_task;
+
+// pb_policy wake callback: a single notification. Runs on whatever task
+// requested the policy change (the button task); keep it minimal.
+static void control_wake(void)
+{
+    if (s_control_task) xTaskNotifyGive(s_control_task);
+}
+
+// Thin adapter: the button driver's event -> the policy handler. The Power+Auto
+// recovery combo is intercepted here (not forwarded to policy): flash all panel
+// LEDs 3x as a "config erased" acknowledgement, wipe NVS, and reboot. The reboot
+// itself cuts the heater, so this is inherently fail-safe.
+static void button_cb(pb_button_id_t id, pb_button_event_t ev)
+{
+    if (ev == PB_BUTTON_RESET) {
+        ESP_LOGW(TAG, "reset combo: erasing NVS (config) and rebooting");
+        pb_leds_flash_all(3, 200, 200);   // ~1.2 s all-LEDs acknowledgement
+        (void)nvs_flash_erase();
+        esp_restart();
+        return;   // unreachable
+    }
+    pb_policy_on_button(id, ev);
+}
+
+// Migrate the previous "OpenPanda_" AP default (pre-DragonBreath rebrand) so an
+// already-provisioned device adopts the current name while preserving any
+// user-customized SSID. Fresh devices get this prefix from dc_wifi_set_identity().
+#ifndef CONFIG_PB_HIL_DEVBOARD
+static void brand_ap(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("app_nvs", NVS_READWRITE, &h) != ESP_OK) return;
+    // Set the default once (avoid NVS flash wear each boot) and never clobber a
+    // user-customized name — but DO migrate the legacy "OpenPanda_" default.
+    char cur[33] = {0};
+    size_t sz = sizeof cur;
+    esp_err_t r = nvs_get_str(h, "ap_ssid", cur, &sz);
+    if (r == ESP_OK && sz > 1 && strncmp(cur, "OpenPanda_", 10) != 0) {
+        nvs_close(h);
+        return;
+    }
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    char ssid[33];
+    snprintf(ssid, sizeof ssid, "DragonBreath_%02X%02X", mac[4], mac[5]);
+    nvs_set_str(h, "ap_ssid", ssid);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "AP SSID default set: %s", ssid);
+}
+
+static esp_err_t configure_core_identity(void)
+{
+    // "dragonbreath" is the DEFAULT hostname; dc_wifi applies a user override
+    // persisted via dc_wifi_set_hostname() (the portal Device section) over it
+    // at start, so no per-product hostname glue is needed here.
+    const dc_wifi_identity_t identity = {
+        .hostname = "dragonbreath",
+        .instance_name = "DragonBreath",
+        .ap_ssid_prefix = "DragonBreath_",
+        .ap_password = DC_WIFI_DEFAULT_AP_PASSWORD,
+    };
+    return dc_wifi_set_identity(&identity);
+}
+#endif
+
+static void nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+}
+
+static bool load_bambu_direct_chamber_control(void)
+{
+    uint8_t enabled = 0;   // default OFF: existing Bambu installs keep local regulation
+    nvs_handle_t h;
+    if (nvs_open(DB_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        (void)nvs_get_u8(h, DB_NVS_KEY_BAMBU_CHAMBER_CTL, &enabled);
+        nvs_close(h);
+    }
+    return enabled != 0;
+}
+
+#if defined(DB_WIFI_SSID) || defined(DB_MOONRAKER_HOST)
+// Dev-only: seed WiFi creds + Moonraker config into the NVS layout the shared
+// components load at start (namespace app_nvs; keys ssid/password + mk_host/mk_port).
+// This is what the portal would normally write. IMPORTANT: seed via NVS and let
+// dc_moonraker_start() load it — do NOT call dc_moonraker_set_config() before
+// _start(): set_config takes an internal mutex that _start() creates, so calling
+// it first dereferences a NULL semaphore handle (asserts / reboot loop).
+static void seed_dev_config(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("app_nvs", NVS_READWRITE, &h) != ESP_OK) return;
+    // Only seed if not already provisioned — so captive-portal / user-entered
+    // creds always win over the dev default.
+    size_t sz = 0;
+    if (nvs_get_str(h, "ssid", NULL, &sz) == ESP_OK && sz > 1) {
+        nvs_close(h);
+        ESP_LOGI(TAG, "WiFi creds already in NVS; not seeding dev_config");
+        return;
+    }
+#ifdef DB_WIFI_SSID
+    nvs_set_str(h, "ssid", DB_WIFI_SSID);
+    nvs_set_str(h, "password", DB_WIFI_PASS);
+    // Match a normal provisioning: FALLBACK = STA-only while connected (no concurrent
+    // AP). Without this the mode defaults to AP_ALWAYS, so a weak/flapping STA leaves
+    // the softAP up and the SPA bounces to /setup whenever network_mode reads "ap".
+    nvs_set_u8(h, "ap_mode", DC_WIFI_AP_FALLBACK);
+#endif
+#ifdef DB_MOONRAKER_HOST
+    nvs_set_str(h, "mk_host", DB_MOONRAKER_HOST);
+    nvs_set_u16(h, "mk_port", DB_MOONRAKER_PORT);
+#endif
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "seeded dev config into NVS (app_nvs)");
+}
+#endif
+
+static void control_task(void *arg)
+{
+    const TickType_t period = pdMS_TO_TICKS(PB_TICK_PERIOD_MS);
+    TickType_t next_deadline = xTaskGetTickCount() + period;
+    int dbg = 0;
+
+    // Subscribe this task to the task watchdog so a hung control loop panics
+    // (-> reboot -> heater off on boot) rather than silently stalling. Check the
+    // result so we don't silently claim coverage that isn't actually armed.
+    bool wdt_armed = (esp_task_wdt_add(NULL) == ESP_OK);
+    if (!wdt_armed) {
+        // Fail closed: without watchdog coverage a hung control loop could leave
+        // the SSR energized undetected, so refuse to heat for the rest of this
+        // boot. This is a PERMANENT inhibit — API clear_fault cannot clear it (unlike
+        // a normal fault); only a power cycle (which re-attempts enrollment) can.
+        ESP_LOGE(TAG, "task WDT subscribe FAILED — inhibiting heat (reboot required)");
+        pb_heater_inhibit("task watchdog unavailable");
+    }
+
+    for (;;) {
+        // Keep source-specific snapshots alive through the status logger below.
+        // Previously only the Moonraker snapshot survived that far, so Bambu mode
+        // misleadingly rendered zero-initialized Moonraker diagnostics.
+        dc_moonraker_status_t st = {0};
+        dc_bambu_status_t bs = {0};
+#ifndef CONFIG_PB_HIL_DEVBOARD
+
+        // Feed the AUTO seam from whichever ONE source is bound.
+        // All paths converge on pb_policy_set_env(); the policy remains
+        // source-agnostic. Printer-reported chamber temperature is passed through
+        // only when the Bambu direct-control opt-in is enabled. DragonBreath's
+        // local sensors remain authoritative for heater safety in either mode.
+        float bed_c = 0.0f;
+        float bed_target_c = 0.0f;
+        float src_target_c = 0.0f;
+        float chamber_src_c = NAN;
+        bool  src_connected = false;
+        bool  klipper_helper_present = false;   // Klipper [dragonbreath] helper seen
+                                                // on Moonraker -> AUTO defers to it
+
+        if (s_net_up) {
+            switch (s_src) {
+
+            case DC_SRC_BAMBU:
+                if (s_bambu_up) {
+                    dc_bambu_get_status(&bs);
+
+                    src_connected = (bs.state == DC_BAMBU_SUBSCRIBED);
+
+                    if (src_connected) {
+                        if (isfinite(bs.bed_temp))
+                            bed_c = bs.bed_temp;
+
+                        if (isfinite(bs.bed_target))
+                            bed_target_c = bs.bed_target;
+
+                        if (s_bambu_direct_chamber_control && isfinite(bs.chamber_temp))
+                            chamber_src_c = bs.chamber_temp;
+
+                        // Filament chamber zone: while a print is active,
+                        // request the active filament's zone target
+                        // (0 = no zone -> normal bed-AUTO).
+                        if (bs.printing)
+                            src_target_c =
+                                (float)dc_bambu_zone_target(bs.filament);
+                    }
+                }
+                break;
+            case DC_SRC_HA:
+                // HA is a controller, not a bed source — no AUTO follow. It drives
+                // target/mode through pb_policy directly. Pumped below (s_ha_up),
+                // which also covers HA running read-only alongside another source.
+                break;
+            case DC_SRC_KLIPPER_MQTT:
+                // Klipper-over-MQTT is also a controller (not a bed source): Klipper
+                // macros publish desired-state, the client runs the retained-aware
+                // arming machine and drives target/mode through pb_policy directly.
+                if (s_km_up) db_klipper_mqtt_tick();
+                break;
+            case DC_SRC_PRUSA:
+                // PrusaLink reports no filament type: FOLLOW THE BED. Engage the
+                // chamber (to the AUTO card's target) once the printer's bed setpoint
+                // reaches the AUTO card's bed threshold. Both come from pb_policy — the
+                // Auto card supplies this source's bed->chamber rule (no filament zones).
+                if (s_prusa_up) {
+                    dc_prusa_status_t ps;
+                    dc_prusa_get_status(&ps);
+                    src_connected = ps.online;
+                    if (src_connected) {
+                        if (isfinite(ps.bed_temp)) bed_c = ps.bed_temp;
+                        bed_target_c = ps.bed_target;
+                        pb_policy_snapshot_t pol;
+                        pb_policy_get_snapshot(&pol);
+                        if (pol.params.auto_bed_threshold_c > 0.0f &&
+                            ps.bed_target >= pol.params.auto_bed_threshold_c)
+                            src_target_c = pol.params.auto_target_c;
+                    }
+                }
+                break;
+            case DC_SRC_NONE:
+                break;   // unbound: no bed source, feeds zeros/not-connected
+            case DC_SRC_KLIPPER:
+            default:
+                if (s_mk_up) {
+                    dc_moonraker_get_status(&st);
+                    src_connected = (st.state == DC_MK_SUBSCRIBED);
+                    // The [dragonbreath] Klipper helper is itself a manual chamber
+                    // controller; when it's installed, AUTO must defer to it.
+                    klipper_helper_present = st.db_present;
+                    bed_c = st.bed_temp;
+                    bed_target_c = st.bed_target;
+                    // Filament chamber zone, same as Bambu: while a print is active
+                    // and Moonraker reports the material (gcode metadata / save_variables),
+                    // request that filament's zone target (0 = no zone -> normal bed-AUTO).
+                    bool printing = st.printing || st.printer == DC_PRINTER_PREPARING
+                                                || st.printer == DC_PRINTER_PAUSED;
+                    if (src_connected && printing && st.material[0])
+                        src_target_c = (float)dc_bambu_zone_target(st.material);
+                }
+                break;
+            }
+        }
+        pb_policy_set_env(
+            bed_c,
+            bed_target_c,
+            src_connected,
+            src_target_c,
+            chamber_src_c
+        );
+        pb_policy_set_klipper_helper(klipper_helper_present);
+        // Home Assistant: pump the client whenever it's up — full-control when HA is
+        // the selected source, or read-only when it runs alongside another source
+        // (Bambu/Klipper) as a monitor. pb_ha_tick() no-ops until connected.
+        if (s_ha_up) pb_ha_tick();
+#endif
+
+        // Safety/control loop: enforces every heater cutoff + fan-follows-heater.
+        // pb_policy is the sole mode/target writer. Network clients and local
+        // inputs submit commands to it; this task applies the resulting outputs.
+#ifdef CONFIG_PB_BOARD_U1BREATH
+        // Bed probe: take the sample that feeds pb_ntc's smoothed reading, which
+        // pb_policy's local AUTO trigger and the filtration band read each tick.
+        { float bed_probe_c; (void)pb_ntc_read(PB_NTC_BED, &bed_probe_c); }
+#endif
+        pb_policy_tick();
+        if (wdt_armed) esp_task_wdt_reset();   // successful loop iteration
+
+        if (++dbg >= 4) {   // ~2 s
+            dbg = 0;
+            bool net = s_net_up;
+            pb_policy_snapshot_t snap;
+            pb_policy_get_snapshot(&snap);
+            uint32_t zc = 0, zciv = 0, zcrej = 0;
+            pb_fan_zc_diag(&zc, &zciv, &zcrej);
+            // Build the status line WITHOUT the ZC counters (which change every
+            // sample). Collapse consecutive identical states into a single
+            // "repeated Nx" instead of spamming a line every 2 s — this keeps the
+            // /console ring (and the serial log) readable. A liveness flush every
+            // ~30 samples (~60 s) still shows the device is alive during a long
+            // unchanged run.
+            static char     s_dbg_last[224];
+            static uint32_t s_dbg_rep;
+            int wifi = net ? (int)dc_wifi_state() : -1;
+            // Displayed line: 0.1 °C precision. Keep diagnostics source-native:
+            // Bambu must never be rendered through a zeroed Moonraker struct.
+            char line[224];
+            char key[224];
+            if (s_src == DC_SRC_BAMBU) {
+                const char *filament = bs.filament[0] ? bs.filament : "-";
+                snprintf(line, sizeof line,
+                    "rev=%lu mode=%s source=%s target=%.0fC heater=%s | chamber=%.1fC ptc=%.1fC | "
+                    "wifi=%d src=bambu link=%d print=%s filament=%s bed=%.1f/%.1f chsrc=%.1f",
+                    (unsigned long)snap.state_revision,
+                    pb_policy_mode_str(snap.mode), pb_policy_source_str(snap.source),
+                    snap.effective_target_c, snap.heater_output ? "ON" : "off",
+                    snap.chamber_c, snap.ptc_c,
+                    wifi, (int)bs.state, bs.printing ? "yes" : "no", filament,
+                    bs.bed_temp, bs.bed_target, bs.chamber_temp);
+                // Dedup key: same fields but temps rounded to whole degrees.
+                snprintf(key, sizeof key,
+                    "rev=%lu mode=%s source=%s target=%.0fC heater=%s | chamber=%.0fC ptc=%.0fC | "
+                    "wifi=%d src=bambu link=%d print=%s filament=%s bed=%.0f/%.0f chsrc=%.0f",
+                    (unsigned long)snap.state_revision,
+                    pb_policy_mode_str(snap.mode), pb_policy_source_str(snap.source),
+                    snap.effective_target_c, snap.heater_output ? "ON" : "off",
+                    snap.chamber_c, snap.ptc_c,
+                    wifi, (int)bs.state, bs.printing ? "yes" : "no", filament,
+                    bs.bed_temp, bs.bed_target, bs.chamber_temp);
+            } else {
+                snprintf(line, sizeof line,
+                    "rev=%lu mode=%s source=%s target=%.0fC heater=%s | chamber=%.1fC ptc=%.1fC | "
+                    "wifi=%d src=%s mk=%d printer=%s bed=%.1f",
+                    (unsigned long)snap.state_revision,
+                    pb_policy_mode_str(snap.mode), pb_policy_source_str(snap.source),
+                    snap.effective_target_c, snap.heater_output ? "ON" : "off",
+                    snap.chamber_c, snap.ptc_c,
+                    wifi, dc_source_str(s_src), (int)st.state,
+                    dc_printer_state_str(st.printer), st.bed_temp);
+                snprintf(key, sizeof key,
+                    "rev=%lu mode=%s source=%s target=%.0fC heater=%s | chamber=%.0fC ptc=%.0fC | "
+                    "wifi=%d src=%s mk=%d printer=%s bed=%.0f",
+                    (unsigned long)snap.state_revision,
+                    pb_policy_mode_str(snap.mode), pb_policy_source_str(snap.source),
+                    snap.effective_target_c, snap.heater_output ? "ON" : "off",
+                    snap.chamber_c, snap.ptc_c,
+                    wifi, dc_source_str(s_src), (int)st.state,
+                    dc_printer_state_str(st.printer), st.bed_temp);
+            }
+
+            if (strcmp(key, s_dbg_last) == 0) {
+                s_dbg_rep++;
+                if (s_dbg_rep % 30 == 0)   // ~60 s liveness flush during a long run
+                    ESP_LOGI(TAG, "%s | repeated %lux | ZC n=%lu dt=%luus rejected=%lu",
+                             line, (unsigned long)s_dbg_rep,
+                             (unsigned long)zc, (unsigned long)zciv,
+                             (unsigned long)zcrej);
+            } else {
+                if (s_dbg_rep > 0)
+                    ESP_LOGI(TAG, "(previous line repeated %lux)", (unsigned long)s_dbg_rep);
+                ESP_LOGI(TAG, "%s | ZC n=%lu dt=%luus rejected=%lu",
+                         line, (unsigned long)zc, (unsigned long)zciv,
+                         (unsigned long)zcrej);
+                strncpy(s_dbg_last, key, sizeof s_dbg_last - 1);
+                s_dbg_last[sizeof s_dbg_last - 1] = '\0';
+                s_dbg_rep = 0;
+            }
+        }
+
+        // Wait for the next periodic deadline, but wake early on a notification
+        // (an accepted control command or policy panic-off). Guardrails so
+        // notifications can never drag or accelerate the safety schedule: the
+        // deadline is ABSOLUTE; a notify wake runs one extra full tick against
+        // the SAME deadline; only a timeout advances it (with an overrun
+        // resync). Every wake, notified or timed out, runs the complete
+        // pb_policy_tick() above — there is no partial "just drop the SSR"
+        // path. The watchdog is fed only after that successful tick, so an
+        // extra iteration keeps coverage armed.
+        // Use SIGNED deltas so the comparison stays correct across the 32-bit
+        // tick-count wrap (~497 days at 100 Hz). An unsigned `next_deadline > now`
+        // inverts right at the wrap and would busy-spin full ticks for up to one
+        // period, starving lower-priority tasks — see the invariant above.
+        int32_t remaining = (int32_t)(next_deadline - xTaskGetTickCount());
+        TickType_t wait = remaining > 0 ? (TickType_t)remaining : 0;
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, wait);
+        if (notified == 0) {          // periodic timeout: advance one period
+            next_deadline += period;
+            // Overran (still not ahead of now, e.g. after a long stall): resync
+            // forward instead of bursting to catch up.
+            if ((int32_t)(next_deadline - xTaskGetTickCount()) <= 0)
+                next_deadline = xTaskGetTickCount() + period;
+        }
+        // notified != 0: run again immediately, deadline unchanged.
+    }
+}
+
+void app_main(void)
+{
+    // Install the console-capture hook FIRST so the whole app_main boot log is
+    // teed into the ring served by /console (the device may have no reachable
+    // serial port). Cheap + no dependencies; safe before anything else.
+    dc_evlog_console_init();
+
+    ESP_LOGI(TAG, "DragonBreath starting");
+
+    dc_evlog_init();
+    pb_board_init();
+    ESP_ERROR_CHECK(pb_heater_init());     // SSR forced OFF before anything else
+    ESP_ERROR_CHECK(pb_ntc_init());
+    ESP_ERROR_CHECK(pb_fan_init());
+    ESP_ERROR_CHECK(pb_policy_init());
+    ESP_ERROR_CHECK(pb_leds_start());       // indicator LEDs (pb_policy drives them)
+
+    // Bring up NVS and load persisted config/state BEFORE the control task starts.
+    // NVS is local + fast (unlike network bring-up, which stays after the safety
+    // loop), and the control task must see a restored fault latch on its very first
+    // tick AND be able to persist a fault that trips during early boot — so a
+    // safety trip can never be lost across a reboot for want of an initialized NVS.
+    nvs_init();
+    s_bambu_direct_chamber_control = load_bambu_direct_chamber_control();
+    ESP_LOGI(TAG, "Bambu direct chamber control: %s",
+             s_bambu_direct_chamber_control ? "enabled" : "disabled");
+    pb_heater_load_config();                 // persisted max-target + comms timeout
+    pb_heater_load_fault();                  // restore a persisted safety-fault latch (fail-safe on NVS error)
+    pb_ntc_load_calibration();               // persisted per-channel offsets (clamped ±5 °C on load)
+    pb_leds_load_config();                   // persisted status-LED master enable (default ON)
+    pb_policy_load_params();                 // remembered mode params (never a mode/target — boot stays OFF)
+
+    // Start the safety/telemetry loop — it then runs regardless of the network
+    // coming up (a blocking/hung network stack must never stop it). The SSR is
+    // already forced off by pb_heater_init(), so nothing can arm heat before this;
+    // command inputs (buttons/HIL) start after so a press can't arm a target before
+    // this task — the sole actuator — is running.
+    xTaskCreate(control_task, "pb_control", 4096, NULL, 10, &s_control_task);
+    pb_policy_set_wake_cb(control_wake);     // accepted commands can now wake the loop
+    ESP_LOGI(TAG, "control loop running; heater held OFF (bring-up: no auto-heat)");
+
+    // Command inputs come up AFTER the actuator task and the remembered params:
+    // a button press arms a mode from those params, so both must exist first.
+    ESP_ERROR_CHECK(pb_buttons_start(button_cb));
+#ifdef CONFIG_PB_HIL_CONSOLE
+    ESP_ERROR_CHECK(pb_hil_start());
+#endif
+#ifndef CONFIG_PB_HIL_DEVBOARD
+    esp_err_t e;
+    if ((e = configure_core_identity()) != ESP_OK)
+        ESP_LOGE(TAG, "dc_wifi_set_identity: %s (using family defaults)", esp_err_to_name(e));
+    brand_ap();                              // AP name = DragonBreath_XXXX
+#if defined(DB_WIFI_SSID) || defined(DB_MOONRAKER_HOST)
+    seed_dev_config();
+#endif
+    // Network bring-up is LOG-AND-CONTINUE, never ESP_ERROR_CHECK: a transient
+    // init error (e.g. httpd_start NO_MEM under boot heap pressure) must not
+    // abort/reboot and tear down the safety loop that's already running above.
+    if ((e = dc_wifi_start()) != ESP_OK)
+        ESP_LOGE(TAG, "dc_wifi_start: %s (continuing; safety loop unaffected)", esp_err_to_name(e));
+    // ESP-NOW peer provider: broadcast our heater capability for consumers (DragonVent).
+    // Advisory only; non-fatal like the rest of network bring-up.
+    if ((e = pb_peer_start()) != ESP_OK)
+        ESP_LOGW(TAG, "pb_peer_start: %s (continuing without peer broadcast)", esp_err_to_name(e));
+    // Control-source selector: start ONLY the bound client. Klipper is the
+    // default and the shipped path; Bambu/HA are opt-in. Each is log-and-continue
+    // like the rest of network bring-up — a source that fails to init just leaves
+    // the device without printer-follow, never aborting the safety loop.
+    s_src = dc_source_get();
+    switch (s_src) {
+    case DC_SRC_BAMBU:
+        if ((e = dc_bambu_start()) != ESP_OK)
+            ESP_LOGE(TAG, "dc_bambu_start: %s (continuing; no printer follow)", esp_err_to_name(e));
+        else
+            s_bambu_up = true;
+        break;
+    case DC_SRC_HA:
+        if ((e = pb_ha_start()) != ESP_OK)
+            ESP_LOGE(TAG, "pb_ha_start: %s (continuing; no HA control)", esp_err_to_name(e));
+        else
+            s_ha_up = true;
+        break;
+    case DC_SRC_KLIPPER_MQTT:
+        if ((e = db_klipper_mqtt_start()) != ESP_OK)
+            ESP_LOGE(TAG, "db_klipper_mqtt_start: %s (continuing; no MQTT control)", esp_err_to_name(e));
+        else
+            s_km_up = true;
+        break;
+    case DC_SRC_PRUSA:
+        if ((e = dc_prusa_start()) != ESP_OK)
+            ESP_LOGE(TAG, "dc_prusa_start: %s (continuing; no printer follow)", esp_err_to_name(e));
+        else
+            s_prusa_up = true;
+        break;
+    case DC_SRC_NONE:
+        ESP_LOGI(TAG, "control source: none (unbound) — no external controller");
+        break;
+    case DC_SRC_KLIPPER:
+    default:
+        if ((e = dc_moonraker_start()) != ESP_OK)
+            ESP_LOGE(TAG, "dc_moonraker_start: %s (continuing; will not query moonraker)", esp_err_to_name(e));
+        else
+            s_mk_up = true;
+        break;
+    }
+    ESP_LOGI(TAG, "control source: %s", dc_source_str(s_src));
+    // Home Assistant read-only telemetry alongside a non-HA control source: if an HA
+    // broker is configured but HA is NOT the selected source, start pb_ha in read-only
+    // monitor mode (publishes sensors + state, never controls). When HA *is* the
+    // source it already started above in full-control mode.
+    if (s_src != DC_SRC_HA) {
+        size_t sz = 0;
+        bool ha_cfg = false;
+        nvs_handle_t hh;
+        if (nvs_open("app_nvs", NVS_READONLY, &hh) == ESP_OK) {
+            ha_cfg = (nvs_get_str(hh, "ha_host", NULL, &sz) == ESP_OK && sz > 1);
+            nvs_close(hh);
+        }
+        if (ha_cfg) {
+            if ((e = pb_ha_start_readonly()) != ESP_OK)
+                ESP_LOGE(TAG, "pb_ha_start_readonly: %s (continuing; no HA telemetry)", esp_err_to_name(e));
+            else {
+                s_ha_up = true;
+                ESP_LOGI(TAG, "Home Assistant read-only telemetry enabled alongside %s", dc_source_str(s_src));
+            }
+        }
+    }
+    if ((e = db_portal_start()) != ESP_OK)
+        ESP_LOGE(TAG, "db_portal_start: %s (continuing)", esp_err_to_name(e));
+
+    s_net_up = true;
+    ESP_LOGI(TAG, "network bring-up done (wifi + moonraker + http api + portal, best-effort)");
+#else
+    ESP_LOGW(TAG, "HIL dev-board target: network stack skipped; inject env over serial");
+#endif
+
+    // OTA rollback confirm: we reached a healthy state (safety loop running, init
+    // complete), so mark this image valid and cancel the pending-verify rollback.
+    // A future web-flashed image that crashes before here reverts to the last
+    // good app on reboot. No-op unless we actually booted in PENDING_VERIFY.
+    esp_ota_mark_app_valid_cancel_rollback();
+}

@@ -1,0 +1,35 @@
+name: cad
+
+# pull_request only: a push to a PR branch already triggers this, and a second
+# push-event run would only double the failure emails.
+on:
+  pull_request:
+    paths: ["cad/**", ".github/workflows/cad.yml"]
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check the model is present
+        id: present
+        run: |
+          if [ -f cad/build.py ]; then echo present=true >> "$GITHUB_OUTPUT"; else echo "cad/build.py not on this branch yet; skipping"; echo present=false >> "$GITHUB_OUTPUT"; fi
+      - name: Install CadQuery
+        if: steps.present.outputs.present == 'true'
+        run: pip install cadquery pytest
+      - name: Export parts
+        if: steps.present.outputs.present == 'true'
+        run: python cad/build.py
+      - name: Envelope and clearance tests
+        if: steps.present.outputs.present == 'true'
+        run: python -m pytest cad/tests -q
+      - uses: actions/upload-artifact@v4
+        if: steps.present.outputs.present == 'true'
+        with:
+          name: u1breath-cad
+          path: cad/out

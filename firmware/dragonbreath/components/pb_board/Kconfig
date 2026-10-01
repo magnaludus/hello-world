@@ -1,0 +1,27 @@
+menu "DragonBreath board"
+
+choice PB_BOARD
+    prompt "Target board"
+    default PB_BOARD_PANDA
+    help
+        Selects the GPIO map, NTC divider, fan and LED backends. The policy,
+        safety model, HTTP API and web UI are identical on every board.
+
+config PB_BOARD_PANDA
+    bool "BIGTREETECH Panda Breath V1.0 / V1.0.1 (ESP32-C3-MINI-1)"
+    help
+        The stock Panda Breath board: SSR on GPIO18, AC blower TRIAC on GPIO3
+        with zero-cross on GPIO7, two NTCs with a strap-selected 82k/33k
+        divider, four panel LEDs and four buttons.
+
+config PB_BOARD_U1BREATH
+    bool "U1 Breath (Seeed XIAO ESP32-C3, DC blower, 3x 100K NTC)"
+    help
+        The U1 Breath chamber heater for the Snapmaker U1: SSR on GPIO6, 24 V
+        DC blower PWM on GPIO7 through a logic-level MOSFET, three 100K/3950
+        NTCs on GPIO2/3/4 with fixed 100k dividers (chamber, duct, bed probe),
+        one WS2812 status LED on GPIO10 and the XIAO BOOT button on GPIO9.
+
+endchoice
+
+endmenu
