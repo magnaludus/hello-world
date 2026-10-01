@@ -1,0 +1,98 @@
+{
+  "name": "devboard AUTO environment injection",
+  "targets": ["devboard"],
+  "steps": [
+    {
+      "name": "start safe",
+      "send": {"cmd": "off"},
+      "expect": {
+        "ok": true,
+        "state.mode": "off",
+        "state.heater_output": false,
+        "state.io.mains_gpio_compiled_out": true
+      }
+    },
+    {
+      "name": "nominal chamber",
+      "send": {"cmd": "sensor", "channel": "chamber", "status": "ok", "temp_c": 25}
+    },
+    {
+      "name": "nominal PTC",
+      "send": {"cmd": "sensor", "channel": "ptc", "status": "ok", "temp_c": 25}
+    },
+    {
+      "name": "select AUTO",
+      "send": {
+        "cmd": "mode",
+        "mode": "auto",
+        "target_c": 55,
+        "bed_threshold_c": 100
+      }
+    },
+    {
+      "name": "disconnected printer cannot engage",
+      "send": {
+        "cmd": "env",
+        "connected": false,
+        "bed_c": 110,
+        "src_target_c": 55,
+        "chamber_src_c": 25
+      }
+    },
+    {"name": "allow disconnected tick", "wait_s": 0.7},
+    {
+      "name": "AUTO remains cold while disconnected",
+      "send": {"cmd": "state"},
+      "expect": {
+        "ok": true,
+        "state.mode": "auto",
+        "state.auto_engaged": false,
+        "state.heater_output": false
+      }
+    },
+    {
+      "name": "connect with an active source zone",
+      "send": {
+        "cmd": "env",
+        "connected": true,
+        "bed_c": 100,
+        "src_target_c": 55,
+        "chamber_src_c": 25
+      }
+    },
+    {"name": "allow engaged tick", "wait_s": 0.7},
+    {
+      "name": "AUTO engages",
+      "send": {"cmd": "state"},
+      "expect": {
+        "ok": true,
+        "state.auto_engaged": true,
+        "state.effective_target_c": 55,
+        "state.heater_output": true
+      }
+    },
+    {
+      "name": "disconnect live printer",
+      "send": {
+        "cmd": "env",
+        "connected": false,
+        "bed_c": 100,
+        "src_target_c": 55,
+        "chamber_src_c": 25
+      }
+    },
+    {"name": "allow fail-closed tick", "wait_s": 0.7},
+    {
+      "name": "AUTO drops heat without latching a sensor fault",
+      "send": {"cmd": "state"},
+      "expect": {
+        "ok": true,
+        "state.mode": "auto",
+        "state.auto_engaged": false,
+        "state.heater_output": false,
+        "state.fault_latched": false
+      }
+    },
+    {"name": "finish off", "send": {"cmd": "off"}}
+  ]
+}
