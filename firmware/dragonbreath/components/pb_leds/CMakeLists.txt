@@ -2,7 +2,7 @@
 # single WS2812 status pixel. Both implement the same pb_leds.h API.
 if(CONFIG_PB_BOARD_U1BREATH)
     set(PB_LEDS_SRCS "pb_leds_ws2812.c")
-    set(PB_LEDS_PRIV_REQUIRES led_strip)
+    set(PB_LEDS_PRIV_REQUIRES espressif__led_strip)
 else()
     set(PB_LEDS_SRCS "pb_leds.c")
     set(PB_LEDS_PRIV_REQUIRES "")
