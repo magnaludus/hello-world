@@ -217,6 +217,7 @@ static const float PB_RT_R_KOHM[] = {
       3.7f,  3.6f,  3.5f,  3.4f,                                          // 122-125
 };
 #define PB_RT_N ((int)(sizeof(PB_RT_R_KOHM) / sizeof(PB_RT_R_KOHM[0])))
+#endif // CONFIG_PB_BOARD_U1BREATH (conversion model)
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_cali[PB_NTC_CHANNEL_COUNT];
@@ -236,6 +237,7 @@ static const adc_channel_t s_chan[PB_NTC_CHANNEL_COUNT] = {
 #endif
 };
 
+#ifndef CONFIG_PB_BOARD_U1BREATH
 // Resistance (kOhm) -> temperature (C), linear interpolation over the R/T table.
 // Interpolation is strictly better than the stock nearest-entry and stays <1C of it.
 static float rntc_to_temp_c(float r_kohm)
@@ -252,7 +254,7 @@ static float rntc_to_temp_c(float r_kohm)
     }
     return NAN; // unreachable
 }
-#endif // CONFIG_PB_BOARD_U1BREATH
+#endif // !CONFIG_PB_BOARD_U1BREATH (stock R/T table)
 
 static float push_average(pb_ntc_channel_t ch, float v)
 {
