@@ -36,6 +36,13 @@ of the cost comes from re-reading large things and from idle wakes.
 - CAD: `python cad/build.py` (about 65 s) and `python -m pytest cad/tests -q`
   (about 30 s). Dimensions live in `cad/u1breath/params.py`.
 
+## v2 (Fusion)
+
+- v2 is modeled in Autodesk Fusion through the owner's Fusion connector, in a local session, from
+  `docs/prd-v2.md`. That PRD is the brief; its section 10 checks are the acceptance gate.
+- v2 exports go to `cad/fusion-v2/` (STL in print orientation, STEP, DXF flat patterns, `.f3d` archive).
+  The v1 CadQuery model in `cad/u1breath/` stays untouched as a reference until v2 passes.
+
 ## Conventions
 
 - Commits: plain imperative subject, body explains why. No model names in commits,
